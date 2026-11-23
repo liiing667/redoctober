@@ -4,7 +4,9 @@
 package core
 
 import (
+	"bytes"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -108,6 +110,15 @@ type SSHSignWithRequest struct {
 
 	Data    []byte
 	TBSData []byte
+
+	// Optional issuance bindings. When set, the core verifies them
+	// against the decrypted key material and the to-be-signed blob
+	// before any signature is produced, so a confused or stale agent
+	// cannot trick the core into signing a different blob, or signing
+	// with a different key, than the one the caller declared.
+	TBSDigest  []byte // SHA-256 digest of TBSData, as computed by the caller
+	Signer     []byte // marshaled SSH public key the caller expects to sign with
+	Generation uint64 // delegation generation observed by the caller
 }
 
 type SSHSignatureWithDelegates struct {
@@ -115,6 +126,14 @@ type SSHSignatureWithDelegates struct {
 	Signature       []byte
 	Secure          bool
 	Delegates       []string
+
+	// Issuance bindings: the final signer identity and the digest of
+	// the blob that was actually signed. Callers must check these
+	// against what they asked for before accepting the signature.
+	Signer            string // authorized-key encoding of the signing public key
+	SignerFingerprint string // SHA-256 fingerprint of the signing public key
+	TBSDigest         []byte // SHA-256 digest of the TBS data that was signed
+	Generation        uint64 // delegation generation echoed from the request
 }
 
 type OwnersRequest struct {
@@ -790,6 +809,14 @@ func SSHSignWith(jsonIn []byte) ([]byte, error) {
 		return jsonStatusError(err)
 	}
 
+	// Bind the declared digest to the to-be-signed blob before doing
+	// any work: the core must never sign a blob whose digest differs
+	// from the one the caller declared.
+	tbsDigest := sha256.Sum256(s.TBSData)
+	if len(s.TBSDigest) != 0 && !bytes.Equal(s.TBSDigest, tbsDigest[:]) {
+		return jsonStatusError(errors.New("tbs data does not match declared digest"))
+	}
+
 	err = validateUser(s.Name, s.Password, false)
 	if err != nil {
 		return jsonStatusError(err)
@@ -819,16 +846,33 @@ func SSHSignWith(jsonIn []byte) ([]byte, error) {
 		return jsonStatusError(err)
 	}
 
+	// Bind the signer identity: if the caller declared which public key
+	// it expects the signature to come from, the decrypted key must
+	// match it before we issue anything.
+	signerPub := signer.PublicKey()
+	if len(s.Signer) != 0 && !bytes.Equal(s.Signer, signerPub.Marshal()) {
+		return jsonStatusError(errors.New("decrypted key does not match declared signer"))
+	}
+
 	var signature *ssh.Signature
 	signature, err = signer.Sign(rand.Reader, s.TBSData)
+	if err != nil {
+		return jsonStatusError(err)
+	}
 	resp := &SSHSignatureWithDelegates{
-		SignatureFormat: signature.Format,
-		Signature:       signature.Blob,
-		Secure:          secure,
-		Delegates:       names,
+		SignatureFormat:   signature.Format,
+		Signature:         signature.Blob,
+		Secure:            secure,
+		Delegates:         names,
+		Signer:            strings.TrimSpace(string(ssh.MarshalAuthorizedKey(signerPub))),
+		SignerFingerprint: ssh.FingerprintSHA256(signerPub),
+		TBSDigest:         tbsDigest[:],
+		Generation:        s.Generation,
 	}
 
 	tags["delegates"] = strings.Join(names, ", ")
+	log.Printf("core.ssh-sign-with issued: user=%s signer=%s tbs-sha256=%x generation=%d",
+		s.Name, ssh.FingerprintSHA256(signerPub), tbsDigest[:], s.Generation)
 
 	out, err := json.Marshal(resp)
 	if err != nil {

@@ -6,6 +6,9 @@ package core
 
 import (
 	"bytes"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/sha256"
 	"encoding/json"
 	"io/ioutil"
 	"os"
@@ -1418,6 +1421,189 @@ func TestSSHSignWith(t *testing.T) {
 	if err != nil {
 	        t.Fatalf("Error verifying ssh-sign-with signature, %v", err)
 	}
+}
+
+// setupSSHSignWithVault creates a vault with a delegated Alice and an
+// SSH key encrypted with the ssh-sign-with usage, returning the
+// encrypted key blob and the corresponding public key.
+func setupSSHSignWithVault(t *testing.T) ([]byte, ssh.PublicKey) {
+	cfg := config.New()
+	Init("memory", cfg)
+
+	delegateJson := []byte("{\"Name\":\"Alice\",\"Password\":\"Hello\",\"Time\":\"10s\",\"Uses\":10}")
+
+	var s ResponseData
+	respJson, err := Create(delegateJson)
+	if err != nil {
+		t.Fatalf("Error in creating account, %v", err)
+	}
+	if err = json.Unmarshal(respJson, &s); err != nil || s.Status != "ok" {
+		t.Fatalf("Error in creating account, %v %v", err, s.Status)
+	}
+
+	respJson, err = Delegate(delegateJson)
+	if err != nil {
+		t.Fatalf("Error in delegating account, %v", err)
+	}
+	if err = json.Unmarshal(respJson, &s); err != nil || s.Status != "ok" {
+		t.Fatalf("Error in delegating account, %v %v", err, s.Status)
+	}
+
+	sshKey, err := ioutil.ReadFile("../testdata/ssh_key")
+	if err != nil {
+		t.Fatalf("Error loading test SSH key, %v", err)
+	}
+
+	sshPubKeyBytes, err := ioutil.ReadFile("../testdata/ssh_key.pub")
+	if err != nil {
+		t.Fatalf("Error loading test SSH pubkey, %v", err)
+	}
+
+	sshPubKey, _, _, _, err := ssh.ParseAuthorizedKey(sshPubKeyBytes)
+	if err != nil {
+		t.Fatalf("Error loading test SSH pubkey, %v", err)
+	}
+
+	e := EncryptRequest{Name: "Alice", Password: "Hello",
+		Owners: []string{"Alice"}, Minimum: 1, Data: sshKey,
+		Usages: []string{"ssh-sign-with"}}
+
+	encryptJson, err := json.Marshal(e)
+	if err != nil {
+		t.Fatalf("Error marshalling encrypt request, %v", err)
+	}
+
+	respJson, err = Encrypt(encryptJson)
+	if err != nil {
+		t.Fatalf("Error in encrypt, %v", err)
+	}
+	if err = json.Unmarshal(respJson, &s); err != nil || s.Status != "ok" {
+		t.Fatalf("Error in encrypt, %v %v", err, s.Status)
+	}
+
+	return s.Response, sshPubKey
+}
+
+func sshSignWithStatus(t *testing.T, req SSHSignWithRequest) (ResponseData, SSHSignatureWithDelegates) {
+	reqJson, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("Error marshalling ssh-sign-with request, %v", err)
+	}
+
+	respJson, err := SSHSignWith(reqJson)
+	if err != nil {
+		t.Fatalf("Error in ssh-sign-with, %v", err)
+	}
+
+	var s ResponseData
+	if err = json.Unmarshal(respJson, &s); err != nil {
+		t.Fatalf("Error in ssh-sign-with, %v", err)
+	}
+
+	var signed SSHSignatureWithDelegates
+	if s.Status == "ok" {
+		if err = json.Unmarshal(s.Response, &signed); err != nil {
+			t.Fatalf("Error unmarshalling ssh-sign-with response, %v", err)
+		}
+	}
+	return s, signed
+}
+
+// TestSSHSignWithBinding checks that the to-be-signed blob, its
+// declared digest, the delegation generation and the signer identity
+// are bound together before a signature is issued, and that the
+// response reports the final signer and TBS digest.
+func TestSSHSignWithBinding(t *testing.T) {
+	encKey, sshPubKey := setupSSHSignWithVault(t)
+
+	tbs := []byte("signme")
+	tbsDigest := sha256.Sum256(tbs)
+
+	// A fully bound request succeeds and reports the final signer
+	// identity and TBS digest.
+	s, signed := sshSignWithStatus(t, SSHSignWithRequest{
+		Name: "Alice", Password: "Hello",
+		Data: encKey, TBSData: tbs,
+		TBSDigest:  tbsDigest[:],
+		Signer:     sshPubKey.Marshal(),
+		Generation: 7,
+	})
+	if s.Status != "ok" {
+		t.Fatalf("Error in bound ssh-sign-with, %v", s.Status)
+	}
+	if !bytes.Equal(signed.TBSDigest, tbsDigest[:]) {
+		t.Fatalf("Response TBS digest %x does not match digest of signed blob %x", signed.TBSDigest, tbsDigest)
+	}
+	if signed.SignerFingerprint != ssh.FingerprintSHA256(sshPubKey) {
+		t.Fatalf("Response signer %v does not match expected %v", signed.SignerFingerprint, ssh.FingerprintSHA256(sshPubKey))
+	}
+	wantSigner := string(bytes.TrimSpace(ssh.MarshalAuthorizedKey(sshPubKey)))
+	if signed.Signer != wantSigner {
+		t.Fatalf("Response signer identity %q does not match %q", signed.Signer, wantSigner)
+	}
+	if signed.Generation != 7 {
+		t.Fatalf("Response generation %v does not match request generation 7", signed.Generation)
+	}
+
+	// The issued signature must still verify against the TBS blob.
+	sshSignature := ssh.Signature{Format: signed.SignatureFormat, Blob: signed.Signature}
+	if err := sshPubKey.Verify(tbs, &sshSignature); err != nil {
+		t.Fatalf("Error verifying bound ssh-sign-with signature, %v", err)
+	}
+
+	// A declared digest that does not match the TBS blob is rejected
+	// before issuance.
+	badDigest := sha256.Sum256([]byte("signsomethingelse"))
+	s, _ = sshSignWithStatus(t, SSHSignWithRequest{
+		Name: "Alice", Password: "Hello",
+		Data: encKey, TBSData: tbs,
+		TBSDigest: badDigest[:],
+	})
+	if s.Status == "ok" {
+		t.Fatalf("Expected error when declared digest does not match TBS data")
+	}
+
+	// A declared signer that does not match the decrypted key is
+	// rejected before issuance.
+	_, otherPubKey := generateSSHKey(t)
+	s, _ = sshSignWithStatus(t, SSHSignWithRequest{
+		Name: "Alice", Password: "Hello",
+		Data: encKey, TBSData: tbs,
+		Signer: otherPubKey.Marshal(),
+	})
+	if s.Status == "ok" {
+		t.Fatalf("Expected error when declared signer does not match decrypted key")
+	}
+
+	// Legacy requests without any bindings keep working.
+	s, signed = sshSignWithStatus(t, SSHSignWithRequest{
+		Name: "Alice", Password: "Hello",
+		Data: encKey, TBSData: tbs,
+	})
+	if s.Status != "ok" {
+		t.Fatalf("Error in legacy ssh-sign-with, %v", s.Status)
+	}
+	if !bytes.Equal(signed.TBSDigest, tbsDigest[:]) {
+		t.Fatalf("Legacy response TBS digest %x does not match %x", signed.TBSDigest, tbsDigest)
+	}
+	if signed.SignerFingerprint != ssh.FingerprintSHA256(sshPubKey) {
+		t.Fatalf("Legacy response signer %v does not match expected %v", signed.SignerFingerprint, ssh.FingerprintSHA256(sshPubKey))
+	}
+}
+
+// generateSSHKey returns a fresh key pair for negative binding checks:
+// only the public key is needed, but the signer is returned as well to
+// keep the helper general.
+func generateSSHKey(t *testing.T) (ssh.Signer, ssh.PublicKey) {
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("Error generating SSH key, %v", err)
+	}
+	signer, err := ssh.NewSignerFromKey(priv)
+	if err != nil {
+		t.Fatalf("Error generating SSH key, %v", err)
+	}
+	return signer, signer.PublicKey()
 }
 
 // Create a vault for the restore tests.
