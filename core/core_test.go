@@ -1649,3 +1649,68 @@ func TestRestore(t *testing.T) {
 	restoreCreateVault(t, pstore, file)
 	afterRestartRestore(t)
 }
+
+// TestRequestSizeBoundary ensures that every core entry point rejects
+// oversized requests with the same error, so direct core callers
+// observe the same rejection boundary as HTTP clients.
+func TestRequestSizeBoundary(t *testing.T) {
+	cfg := config.New()
+	Init("memory", cfg)
+
+	oversized := bytes.Repeat([]byte(" "), MaxRequestSize+1)
+
+	endpoints := map[string]func([]byte) ([]byte, error){
+		"Create":            Create,
+		"Summary":           Summary,
+		"Purge":             Purge,
+		"Delegate":          Delegate,
+		"CreateUser":        CreateUser,
+		"Password":          Password,
+		"Encrypt":           Encrypt,
+		"ReEncrypt":         ReEncrypt,
+		"Decrypt":           Decrypt,
+		"SSHSignWith":       SSHSignWith,
+		"Owners":            Owners,
+		"Modify":            Modify,
+		"Export":            Export,
+		"Order":             Order,
+		"OrdersOutstanding": OrdersOutstanding,
+		"OrderInfo":         OrderInfo,
+		"OrderCancel":       OrderCancel,
+		"Status":            Status,
+		"Restore":           Restore,
+		"ResetPersisted":    ResetPersisted,
+	}
+
+	for name, fn := range endpoints {
+		respJson, err := fn(oversized)
+		if err != nil {
+			t.Fatalf("%s: unexpected error: %v", name, err)
+		}
+
+		var s ResponseData
+		if err := json.Unmarshal(respJson, &s); err != nil {
+			t.Fatalf("%s: undecodable response: %v", name, err)
+		}
+		if s.Status != ErrRequestTooLarge.Error() {
+			t.Fatalf("%s: expected status %q, got %q", name, ErrRequestTooLarge, s.Status)
+		}
+	}
+
+	// A request at exactly the limit must not be rejected for its
+	// size; it fails later (here, at JSON parsing), proving the
+	// rejection boundary is inclusive of MaxRequestSize.
+	atLimit := bytes.Repeat([]byte(" "), MaxRequestSize)
+	respJson, err := Summary(atLimit)
+	if err != nil {
+		t.Fatalf("Summary: unexpected error: %v", err)
+	}
+
+	var s ResponseData
+	if err := json.Unmarshal(respJson, &s); err != nil {
+		t.Fatalf("Summary: undecodable response: %v", err)
+	}
+	if s.Status == ErrRequestTooLarge.Error() {
+		t.Fatalf("Summary: request of exactly MaxRequestSize bytes should not be rejected for its size")
+	}
+}

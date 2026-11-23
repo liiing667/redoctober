@@ -57,6 +57,13 @@ func (c *RemoteServer) getURL(path string) string {
 
 // doAction sends req to the remote server and returns the response
 func (c *RemoteServer) doAction(action string, req []byte) ([]byte, error) {
+	// Enforce the same request size boundary that the server and the
+	// core package enforce, so oversized requests are rejected before
+	// they are ever sent.
+	if err := core.ValidateRequestSize(int64(len(req))); err != nil {
+		return nil, err
+	}
+
 	buf := bytes.NewBuffer(req)
 	url := c.getURL("/" + action)
 	resp, err := c.client.Post(url, "application/json", buf)

@@ -31,6 +31,28 @@ var (
 	orders  order.Orderer
 )
 
+// MaxRequestSize is the maximum size, in bytes, of a JSON request body
+// accepted by the Red October API. The HTTP server rejects oversized
+// requests before reading them, the client library refuses to send
+// oversized requests, and the core entry points below reject oversized
+// input, so HTTP clients and direct core callers observe the same
+// rejection boundary.
+const MaxRequestSize = 1 << 20 // 1 MiB
+
+// ErrRequestTooLarge is returned when a request body exceeds
+// MaxRequestSize.
+var ErrRequestTooLarge = fmt.Errorf("redoctober: request body exceeds maximum size of %d bytes", MaxRequestSize)
+
+// ValidateRequestSize reports whether a request body of the given size
+// is acceptable. A negative size (such as an unknown Content-Length) is
+// accepted here; the read path bounds such requests instead.
+func ValidateRequestSize(size int64) error {
+	if size > MaxRequestSize {
+		return ErrRequestTooLarge
+	}
+	return nil
+}
+
 // Each of these structures corresponds to the JSON expected on the
 // correspondingly named URI (e.g. the delegate structure maps to the
 // JSON that should be sent on the /delegate URI and it is handled by
@@ -342,6 +364,10 @@ func Init(path string, config *config.Config) error {
 
 // Create processes a create request.
 func Create(jsonIn []byte) ([]byte, error) {
+	if err := ValidateRequestSize(int64(len(jsonIn))); err != nil {
+		return jsonStatusError(err)
+	}
+
 	var s CreateRequest
 	var err error
 
@@ -376,6 +402,10 @@ func Create(jsonIn []byte) ([]byte, error) {
 
 // Summary processes a summary request.
 func Summary(jsonIn []byte) ([]byte, error) {
+	if err := ValidateRequestSize(int64(len(jsonIn))); err != nil {
+		return jsonStatusError(err)
+	}
+
 	var s SummaryRequest
 	var err error
 
@@ -410,6 +440,10 @@ func Summary(jsonIn []byte) ([]byte, error) {
 
 // Purge processes a delegation purge request.
 func Purge(jsonIn []byte) ([]byte, error) {
+	if err := ValidateRequestSize(int64(len(jsonIn))); err != nil {
+		return jsonStatusError(err)
+	}
+
 	var s PurgeRequest
 	var err error
 
@@ -445,6 +479,10 @@ func Purge(jsonIn []byte) ([]byte, error) {
 
 // Delegate processes a delegation request.
 func Delegate(jsonIn []byte) ([]byte, error) {
+	if err := ValidateRequestSize(int64(len(jsonIn))); err != nil {
+		return jsonStatusError(err)
+	}
+
 	var s DelegateRequest
 	var err error
 	var tags = map[string]string{"function": "core.Delegate"}
@@ -539,6 +577,10 @@ func Delegate(jsonIn []byte) ([]byte, error) {
 
 // CreateUser processes a create-user request.
 func CreateUser(jsonIn []byte) ([]byte, error) {
+	if err := ValidateRequestSize(int64(len(jsonIn))); err != nil {
+		return jsonStatusError(err)
+	}
+
 	var s CreateUserRequest
 	var err error
 
@@ -587,6 +629,10 @@ func CreateUser(jsonIn []byte) ([]byte, error) {
 
 // Password processes a password change request.
 func Password(jsonIn []byte) ([]byte, error) {
+	if err := ValidateRequestSize(int64(len(jsonIn))); err != nil {
+		return jsonStatusError(err)
+	}
+
 	var err error
 	var s PasswordRequest
 
@@ -618,6 +664,10 @@ func Password(jsonIn []byte) ([]byte, error) {
 
 // Encrypt processes an encrypt request.
 func Encrypt(jsonIn []byte) ([]byte, error) {
+	if err := ValidateRequestSize(int64(len(jsonIn))); err != nil {
+		return jsonStatusError(err)
+	}
+
 	var s EncryptRequest
 	var err error
 	var tags = map[string]string{"function": "core.Encrypt"}
@@ -659,6 +709,10 @@ func Encrypt(jsonIn []byte) ([]byte, error) {
 
 // ReEncrypt processes an Re-encrypt request.
 func ReEncrypt(jsonIn []byte) ([]byte, error) {
+	if err := ValidateRequestSize(int64(len(jsonIn))); err != nil {
+		return jsonStatusError(err)
+	}
+
 	var s ReEncryptRequest
 	var err error
 
@@ -704,6 +758,10 @@ func ReEncrypt(jsonIn []byte) ([]byte, error) {
 
 // Decrypt processes a decrypt request.
 func Decrypt(jsonIn []byte) ([]byte, error) {
+	if err := ValidateRequestSize(int64(len(jsonIn))); err != nil {
+		return jsonStatusError(err)
+	}
+
 	var s DecryptRequest
 	var err error
 	var tags = map[string]string{"function": "core.Decrypt"}
@@ -771,6 +829,10 @@ func Decrypt(jsonIn []byte) ([]byte, error) {
 
 // SSHSignWith signs a message with an SSH key
 func SSHSignWith(jsonIn []byte) ([]byte, error) {
+	if err := ValidateRequestSize(int64(len(jsonIn))); err != nil {
+		return jsonStatusError(err)
+	}
+
 	var s SSHSignWithRequest
 	var err error
 	var tags = map[string]string{"function": "core.SSHSignWith"}
@@ -845,6 +907,10 @@ func SSHSignWith(jsonIn []byte) ([]byte, error) {
 
 // Modify processes a modify request.
 func Modify(jsonIn []byte) ([]byte, error) {
+	if err := ValidateRequestSize(int64(len(jsonIn))); err != nil {
+		return jsonStatusError(err)
+	}
+
 	var s ModifyRequest
 	var err error
 
@@ -895,6 +961,10 @@ func Modify(jsonIn []byte) ([]byte, error) {
 
 // Owners processes a owners request.
 func Owners(jsonIn []byte) ([]byte, error) {
+	if err := ValidateRequestSize(int64(len(jsonIn))); err != nil {
+		return jsonStatusError(err)
+	}
+
 	var s OwnersRequest
 	var err error
 
@@ -926,6 +996,10 @@ func Owners(jsonIn []byte) ([]byte, error) {
 
 // Export returns a backed up vault.
 func Export(jsonIn []byte) ([]byte, error) {
+	if err := ValidateRequestSize(int64(len(jsonIn))); err != nil {
+		return jsonStatusError(err)
+	}
+
 	var s ExportRequest
 	var err error
 
@@ -957,6 +1031,10 @@ func Export(jsonIn []byte) ([]byte, error) {
 
 // Order will request delegations from other users.
 func Order(jsonIn []byte) (out []byte, err error) {
+	if err := ValidateRequestSize(int64(len(jsonIn))); err != nil {
+		return jsonStatusError(err)
+	}
+
 	var o OrderRequest
 
 	defer func() {
@@ -1031,6 +1109,10 @@ func Order(jsonIn []byte) (out []byte, err error) {
 
 // OrdersOutstanding will return a list of currently outstanding orders.
 func OrdersOutstanding(jsonIn []byte) (out []byte, err error) {
+	if err := ValidateRequestSize(int64(len(jsonIn))); err != nil {
+		return jsonStatusError(err)
+	}
+
 	var o OrderOutstandingRequest
 
 	defer func() {
@@ -1058,6 +1140,10 @@ func OrdersOutstanding(jsonIn []byte) (out []byte, err error) {
 
 // OrderInfo will return a list of currently outstanding order numbers.
 func OrderInfo(jsonIn []byte) (out []byte, err error) {
+	if err := ValidateRequestSize(int64(len(jsonIn))); err != nil {
+		return jsonStatusError(err)
+	}
+
 	var o OrderInfoRequest
 
 	defer func() {
@@ -1090,6 +1176,10 @@ func OrderInfo(jsonIn []byte) (out []byte, err error) {
 
 // OrderCancel will cancel an order given an order num
 func OrderCancel(jsonIn []byte) (out []byte, err error) {
+	if err := ValidateRequestSize(int64(len(jsonIn))); err != nil {
+		return jsonStatusError(err)
+	}
+
 	var o OrderCancelRequest
 
 	defer func() {
@@ -1122,6 +1212,10 @@ func OrderCancel(jsonIn []byte) (out []byte, err error) {
 // Status returns the current delegation persistence state. In the
 // future, this may return more data.
 func Status(jsonIn []byte) (out []byte, err error) {
+	if err := ValidateRequestSize(int64(len(jsonIn))); err != nil {
+		return jsonStatusError(err)
+	}
+
 	var req StatusRequest
 
 	defer func() {
@@ -1151,6 +1245,10 @@ func Status(jsonIn []byte) (out []byte, err error) {
 
 // Restore attempts a restoration of the persistence store.
 func Restore(jsonIn []byte) (out []byte, err error) {
+	if err := ValidateRequestSize(int64(len(jsonIn))); err != nil {
+		return jsonStatusError(err)
+	}
+
 	var req DelegateRequest
 	var tags = map[string]string{"function": "core.Restore"}
 
@@ -1189,6 +1287,10 @@ func Restore(jsonIn []byte) (out []byte, err error) {
 // ResetPersisted clears the persisted user data from the server. This
 // request requires an admin.
 func ResetPersisted(jsonIn []byte) (out []byte, err error) {
+	if err := ValidateRequestSize(int64(len(jsonIn))); err != nil {
+		return jsonStatusError(err)
+	}
+
 	var req PurgeRequest
 	var tags = map[string]string{"function": "core.ResetPersisted"}
 

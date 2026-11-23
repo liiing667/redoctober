@@ -67,7 +67,12 @@ type userRequest struct {
 
 // processRequest handles a single request receive on the JSON API for
 // one of the functions named in the functions map above.
-func processRequest(requestType string, w http.ResponseWriter, r *http.Request) {
+//
+// All cheap legitimacy checks (route, method, client certificate
+// identity, connection state and declared size) are performed before
+// the request body is read, so malformed or hostile requests are
+// rejected without consuming the resources a full read requires.
+func processRequest(requestType string, requireClientCert bool, w http.ResponseWriter, r *http.Request) {
 	header := w.Header()
 	header.Set("Content-Type", "application/json")
 	header.Set("Strict-Transport-Security", "max-age=86400; includeSubDomains; preload")
@@ -76,6 +81,9 @@ func processRequest(requestType string, w http.ResponseWriter, r *http.Request) 
 		"request-type": requestType,
 		"request-from": r.RemoteAddr,
 	}
+
+	// Route: only registered endpoints reach this handler, but guard
+	// against unknown request types before doing any work.
 	fn, ok := functions[requestType]
 	if !ok {
 		err := errors.New("redoctober: unknown request for " + requestType)
@@ -83,6 +91,45 @@ func processRequest(requestType string, w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "Unknown request", http.StatusInternalServerError)
 		return
 	}
+
+	// Method: the JSON API only accepts POST requests. Reject anything
+	// else before the request body is read.
+	if r.Method != http.MethodPost {
+		err := fmt.Errorf("redoctober: method %s not allowed for %s", r.Method, requestType)
+		report.Check(err, tags)
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Client certificate identity: when the server requires client
+	// certificates, reject requests without a verified peer certificate
+	// before reading the body.
+	if requireClientCert && (r.TLS == nil || len(r.TLS.PeerCertificates) == 0) {
+		err := errors.New("redoctober: client certificate required for " + requestType)
+		report.Check(err, tags)
+		http.Error(w, "Client certificate required", http.StatusUnauthorized)
+		return
+	}
+
+	// Connection state: if the client has already gone away, don't
+	// spend resources reading its request.
+	if err := r.Context().Err(); err != nil {
+		report.Check(err, tags)
+		http.Error(w, "Client connection closed", http.StatusRequestTimeout)
+		return
+	}
+
+	// Size: reject requests that declare a body larger than the core
+	// limit without reading them, and cap the read so requests that
+	// under-report their size are bounded as well. The limit is shared
+	// with the core package and the client library so every caller
+	// observes the same rejection boundary.
+	if err := core.ValidateRequestSize(r.ContentLength); err != nil {
+		report.Check(err, tags)
+		http.Error(w, "Request body too large", http.StatusRequestEntityTooLarge)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, core.MaxRequestSize)
 
 	body, err := ioutil.ReadAll(r.Body)
 	if err != nil {
@@ -171,13 +218,19 @@ func NewServer(staticPath, addr, caPath string, certPaths, keyPaths []string, us
 	}
 	mux := http.NewServeMux()
 
+	// When a CA is configured, clients must present a certificate
+	// signed by it. The TLS handshake enforces this, and the JSON
+	// handlers re-check the peer identity before reading request
+	// bodies so unauthenticated requests are rejected cheaply.
+	requireClientCert := caPath != ""
+
 	// queue up post URIs
 	for current := range functions {
 		// copy this so reference does not get overwritten
 		requestType := current
 		mux.HandleFunc(requestType, func(w http.ResponseWriter, r *http.Request) {
 			log.Printf("http.server: endpoint=%s remote=%s", requestType, r.RemoteAddr)
-			processRequest(requestType, w, r)
+			processRequest(requestType, requireClientCert, w, r)
 		})
 	}
 
