@@ -70,7 +70,11 @@ type PasswordRecord struct {
 	PasswordSalt   []byte
 	HashedPassword []byte
 	KeySalt        []byte
-	RSAKey         struct {
+	// RevocationGeneration is bumped every time the record is
+	// revoked or deleted. A delegation persisted in an older
+	// generation must not be restored once it has been superseded.
+	RevocationGeneration uint64
+	RSAKey               struct {
 		RSAExp      []byte
 		RSAExpIV    []byte
 		RSAPrimeP   []byte
@@ -454,10 +458,22 @@ func (records *Records) DeleteRecord(name string) error {
 func (records *Records) RevokeRecord(name string) error {
 	if rec, ok := records.GetRecord(name); ok {
 		rec.Admin = false
+		rec.RevocationGeneration++
 		records.SetRecord(rec, name)
 		return records.WriteRecordsToDisk()
 	}
 	return errors.New("Record missing")
+}
+
+// RevokeGeneration returns the current revocation generation of
+// the named record. A missing record is treated as a revocation: a
+// generation of one is returned so that any persisted delegation
+// (which starts at generation zero) is considered stale.
+func (records *Records) RevokeGeneration(name string) uint64 {
+	if rec, ok := records.GetRecord(name); ok {
+		return rec.RevocationGeneration
+	}
+	return 1
 }
 
 // MakeAdmin adds admin status to a given record.

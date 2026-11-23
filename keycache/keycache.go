@@ -37,6 +37,10 @@ type Usage struct {
 	Labels []string  // File labels allowed to decrypt
 	Users  []string  // Set of users allows to decrypt
 	Expiry time.Time // Expiration of usage
+	// Generation is the revocation generation of the delegator at
+	// the time the delegation was made. A restored delegation whose
+	// generation no longer matches the vault record is stale.
+	Generation uint64
 }
 
 // ActiveUser holds the information about an actively delegated key.
@@ -186,6 +190,20 @@ func (cache *Cache) GetSummary() map[string]ActiveUser {
 	return summaryData
 }
 
+// Generation returns the highest revocation generation currently
+// represented in the cache. It is recorded in persisted snapshots so
+// the snapshot's revocation generation stays aligned with the
+// delegations it contains.
+func (cache *Cache) Generation() uint64 {
+	var generation uint64
+	for _, active := range cache.UserKeys {
+		if active.Usage.Generation > generation {
+			generation = active.Usage.Generation
+		}
+	}
+	return generation
+}
+
 // Flush removes all delegated keys. It returns true if the cache
 // wasn't empty (i.e. there were active users removed), and false if
 // the cache was empty.
@@ -209,7 +227,7 @@ func (cache *Cache) Refresh() int {
 	var removed int
 
 	for d, active := range cache.UserKeys {
-		if active.Usage.Expiry.Before(time.Now()) {
+		if active.Usage.expired(time.Now()) {
 			log.Println("Record expired", d.Name, d.Slot, active.Usage.Users, active.Usage.Labels, active.Usage.Expiry)
 			removed++
 			delete(cache.UserKeys, d)
@@ -219,8 +237,35 @@ func (cache *Cache) Refresh() int {
 	return removed
 }
 
+// expired reports whether the delegation's validity period has
+// elapsed. A zero expiry is treated as never expiring.
+func (usage Usage) expired(now time.Time) bool {
+	if usage.Expiry.IsZero() {
+		return false
+	}
+	return !usage.Expiry.After(now)
+}
+
+// Expired reports whether the delegation's validity period has
+// elapsed.
+func (usage Usage) Expired() bool {
+	return usage.expired(time.Now())
+}
+
+// Revoked reports whether the delegation was persisted in an older
+// revocation generation than the delegator's current one.
+func (usage Usage) Revoked(currentGeneration uint64) bool {
+	return usage.Generation != currentGeneration
+}
+
 // AddKeyFromRecord decrypts a key for a given record and adds it to the cache.
 func (cache *Cache) AddKeyFromRecord(record passvault.PasswordRecord, name, password string, users, labels []string, uses int, slot, durationString string) (err error) {
+	return cache.AddKeyFromRecordGeneration(record, name, password, users, labels, uses, slot, durationString, record.RevocationGeneration)
+}
+
+// AddKeyFromRecordGeneration is AddKeyFromRecord with an explicit
+// revocation generation.
+func (cache *Cache) AddKeyFromRecordGeneration(record passvault.PasswordRecord, name, password string, users, labels []string, uses int, slot, durationString string, generation uint64) (err error) {
 	var current ActiveUser
 
 	cache.Refresh()
@@ -234,6 +279,7 @@ func (cache *Cache) AddKeyFromRecord(record passvault.PasswordRecord, name, pass
 	current.Usage.Expiry = time.Now().Add(duration)
 	current.Usage.Users = users
 	current.Usage.Labels = labels
+	current.Usage.Generation = generation
 
 	// get decryption keys
 	switch record.Type {
@@ -419,4 +465,73 @@ func (cache *Cache) Restore() (err error) {
 	}
 
 	return nil
+}
+
+// Snapshot is the serialisable identity of a key cache. It is the
+// single representation shared by start-up loading, explicit
+// restoration, revocation generation checks, expiry checks and the
+// consumer recovery path.
+type Snapshot struct {
+	// ID uniquely identifies a persisted snapshot. Every
+	// consumer of a snapshot (loading, restore, recovery) is handed
+	// the same content-derived ID so it can prove it is operating on
+	// the exact bytes that were loaded and that no partial state has
+	// leaked in.
+	ID string
+	// Generation is the vault-wide revocation generation captured
+	// when the snapshot was persisted.
+	Generation uint64
+	// Users holds the delegations captured in the snapshot.
+	Users map[string]ActiveUser
+}
+
+// RestoreFromSnapshot validates and rebuilds a key cache from a
+// snapshot. Entries that have expired or whose delegator has been
+// revoked (per valid) are skipped. The rebuilt cache is only
+// returned once every retained entry's private key has parsed
+// successfully, so a failure leaves the caller's existing cache
+// untouched: the result is always either the complete, approved
+// snapshot or the previous state, never a partial merge.
+func RestoreFromSnapshot(snapshot Snapshot, valid func(DelegateIndex, ActiveUser) bool) (*Cache, error) {
+	cache := NewCache()
+
+	for di, user := range snapshot.Users {
+		index := parseDelegateIndex(di)
+
+		if user.Usage.expired(time.Now()) {
+			log.Println("Snapshot entry expired, skipping", index.Name, index.Slot)
+			continue
+		}
+
+		if valid != nil && !valid(index, user) {
+			log.Println("Snapshot entry revoked, skipping", index.Name, index.Slot)
+			continue
+		}
+
+		if len(user.Key) == 0 {
+			return nil, errors.New("keycache: no private key in active user")
+		}
+
+		cache.UserKeys[index] = user
+	}
+
+	// Parse every private key before handing the cache back. A
+	// parse failure aborts the whole restore so no partial snapshot
+	// is ever installed.
+	if err := cache.Restore(); err != nil {
+		return nil, err
+	}
+
+	return &cache, nil
+}
+
+// parseDelegateIndex reconstructs a DelegateIndex from the
+// "name-slot" keys produced by GetSummary.
+func parseDelegateIndex(di string) DelegateIndex {
+	parts := strings.SplitN(di, "-", 2)
+	index := DelegateIndex{Name: parts[0]}
+	if len(parts) == 2 {
+		index.Slot = parts[1]
+	}
+	return index
 }

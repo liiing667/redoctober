@@ -13,6 +13,26 @@ import (
 
 var defaultStore Store = &File{}
 
+// Snapshot is the versioned envelope that is encrypted and written
+// to a persistence store. Together with the content-derived identity
+// the store computes over its encrypted bytes (see SnapshotIDFor),
+// the version and revocation generation carried here let start-up
+// loading, an explicit restore, expiry/revocation checks and
+// consumer recovery all reason about the exact same snapshot rather
+// than a loose blob of bytes.
+type Snapshot struct {
+	// Version is the snapshot envelope format version.
+	Version int
+	// Generation is the vault-wide revocation generation captured
+	// when the snapshot was persisted.
+	Generation uint64
+	// Cache is the serialised key cache summary.
+	Cache map[string]keycache.ActiveUser
+}
+
+// SnapshotVersion is the current Snapshot envelope version.
+const SnapshotVersion = 1
+
 // Labels are the labels that the keycache should be encrypted with.
 var Labels = []string{"restore"}
 
@@ -45,6 +65,10 @@ type Status struct {
 // serialising the persistence store, and writing the store to disk.
 type Store interface {
 	Blob() []byte
+	// SnapshotID returns the identity of the snapshot currently
+	// held by the store. It is empty when no snapshot has been
+	// loaded or persisted yet.
+	SnapshotID() string
 	Policy() string
 	Users() []string
 	Store([]byte) error

@@ -61,21 +61,21 @@ func New(records *passvault.Records, cache *keycache.Cache, config *config.Confi
 // both, then he can decrypt it alone).  If a predicate is present, it must be
 // satisfied to decrypt.
 type AccessStructure struct {
-	Minimum    int
-	Names      []string
+	Minimum int
+	Names   []string
 
 	LeftNames  []string
 	RightNames []string
 
-	Predicate  string
+	Predicate string
 }
 
 // Implements msp.UserDatabase
 type UserDatabase struct {
-	names    *[]string
+	names *[]string
 
-	records  *passvault.Records
-	cache    *keycache.Cache
+	records *passvault.Records
+	cache   *keycache.Cache
 
 	user     string
 	labels   []string
@@ -126,9 +126,9 @@ type SingleWrappedKey struct {
 // EncryptedData is the format for encrypted data containing all the
 // keys necessary to decrypt it when delegated.
 type EncryptedData struct {
-	Version   int
-	VaultId   int                         `json:",omitempty"`
-	Labels    []string                    `json:",omitempty"`
+	Version int
+	VaultId int      `json:",omitempty"`
+	Labels  []string `json:",omitempty"`
 	// Usages list the endpoints which may use this data
 	// If empty, only decryption in permitted
 	Usages    []string                    `json:",omitempty"`
@@ -149,8 +149,8 @@ type pair struct {
 type mwkSlice []MultiWrappedKey
 type swkSlice []pair
 
-func (s mwkSlice) Len() int           { return len(s) }
-func (s mwkSlice) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
+func (s mwkSlice) Len() int      { return len(s) }
+func (s mwkSlice) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
 func (s mwkSlice) Less(i, j int) bool { // Alphabetic order
 	var shorter = i
 	if len(s[i].Name) > len(s[j].Name) {
@@ -727,7 +727,13 @@ func (c *Cryptor) store() error {
 		return nil
 	}
 
-	cache, err := json.Marshal(c.cache.GetSummary())
+	snapshot := persist.Snapshot{
+		Version:    persist.SnapshotVersion,
+		Generation: c.cache.Generation(),
+		Cache:      c.cache.GetSummary(),
+	}
+
+	cache, err := json.Marshal(snapshot)
 	if err != nil {
 		return err
 	}
@@ -742,7 +748,14 @@ func (c *Cryptor) store() error {
 		return err
 	}
 
-	return c.persist.Store(cache)
+	// The store only adopts the new snapshot identity once the
+	// complete snapshot has been written, so a failed write leaves
+	// both the blob and the identity pointing at the old snapshot.
+	if err = c.persist.Store(cache); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // ErrRestoreDelegations is a sentinal value returned when more
@@ -775,7 +788,8 @@ func (c *Cryptor) Restore(name, password string, uses int, slot, durationString 
 	// just means there aren't enough delegations yet; the
 	// sentinal value ErrRestoreDelegations is returned to
 	// indicate this. However, the error
-	cache, _, _, names, _, err := c.decrypt(c.persist.Cache(), c.persist.Blob(), name)
+	blob := c.persist.Blob()
+	cache, _, _, names, _, err := c.decrypt(c.persist.Cache(), blob, name)
 	if err != nil {
 		if err == msp.ErrNotEnoughShares {
 			return ErrRestoreDelegations
@@ -785,14 +799,36 @@ func (c *Cryptor) Restore(name, password string, uses int, slot, durationString 
 
 	log.Printf("cryptor.restore success: names=%s", strings.Join(names, ","))
 
-	var uk map[string]keycache.ActiveUser
-	err = json.Unmarshal(cache, &uk)
+	snapshot, err := decodeSnapshot(cache)
 	if err != nil {
 		return err
 	}
 
-	rcache := keycache.NewFrom(uk)
-	err = rcache.Restore()
+	// The shared identity is derived from the exact encrypted bytes
+	// that were loaded at start-up: as long as the on-disk snapshot
+	// is untouched, start-up loading, every restore attempt (even
+	// failed retries) and consumer recovery all see the same
+	// identity. If the blob changed underneath us, the identity
+	// differs and the restore is rejected rather than activating an
+	// unknown, possibly partial snapshot.
+	identity := persist.SnapshotIDFor(blob)
+	if identity != c.persist.SnapshotID() {
+		return errors.New("cryptor: snapshot identity mismatch")
+	}
+	snapshot.ID = identity
+
+	// Validate every entry against the *current* vault before it can
+	// be reactivated: expired delegations and delegations whose
+	// delegator has been revoked (or deleted) since the snapshot was
+	// taken are dropped. Everything happens on a throwaway cache so
+	// that the live cache is only swapped for a complete, approved
+	// snapshot.
+	valid := func(index keycache.DelegateIndex, user keycache.ActiveUser) bool {
+		current := c.records.RevokeGeneration(index.Name)
+		return !user.Usage.Revoked(current)
+	}
+
+	rcache, err := keycache.RestoreFromSnapshot(snapshot, valid)
 	if err != nil {
 		return err
 	}
@@ -801,6 +837,27 @@ func (c *Cryptor) Restore(name, password string, uses int, slot, durationString 
 	c.persist.Persist()
 	c.persist.Cache().Flush()
 	return nil
+}
+
+// decodeSnapshot parses the decrypted persistence payload into a
+// Snapshot. Snapshot envelopes written by this package carry an
+// explicit identity; older on-disk payloads that are bare key cache
+// summaries are still accepted so existing deployments keep working.
+func decodeSnapshot(in []byte) (keycache.Snapshot, error) {
+	var envelope persist.Snapshot
+	if err := json.Unmarshal(in, &envelope); err == nil && envelope.Version == persist.SnapshotVersion {
+		return keycache.Snapshot{
+			Generation: envelope.Generation,
+			Users:      envelope.Cache,
+		}, nil
+	}
+
+	var legacy map[string]keycache.ActiveUser
+	if err := json.Unmarshal(in, &legacy); err != nil {
+		return keycache.Snapshot{}, err
+	}
+
+	return keycache.Snapshot{Users: legacy}, nil
 }
 
 // Status returns the status of the underlying persistence store.

@@ -15,6 +15,11 @@ type File struct {
 	cache  *keycache.Cache
 	state  string
 	blob   []byte
+	// snapshotID identifies the snapshot currently held in blob.
+	// It is set on load and refreshed whenever a new, complete
+	// snapshot is persisted. Every consumer of the store therefore
+	// shares a single snapshot identity.
+	snapshotID string
 }
 
 // Valid ensures the configuration is valid for a file store. Note
@@ -68,6 +73,10 @@ func (f *File) Blob() []byte {
 	return f.blob
 }
 
+func (f *File) SnapshotID() string {
+	return f.snapshotID
+}
+
 func (f *File) Policy() string {
 	return f.config.Policy
 }
@@ -79,7 +88,13 @@ func (f *File) Users() []string {
 func (f *File) Store(blob []byte) error {
 	if f.state == Active {
 		f.blob = blob
-		return ioutil.WriteFile(f.config.Location, blob, 0644)
+		if err := ioutil.WriteFile(f.config.Location, blob, 0644); err != nil {
+			return err
+		}
+		// Only adopt the new snapshot identity once the complete
+		// snapshot has landed on disk; a failed write leaves the
+		// previous identity (and blob) intact.
+		f.snapshotID = SnapshotIDFor(blob)
 	}
 	return nil
 }
@@ -106,6 +121,7 @@ func (f *File) Load() error {
 
 	f.state = Inactive
 	f.blob = in
+	f.snapshotID = SnapshotIDFor(in)
 	return nil
 }
 
@@ -118,7 +134,7 @@ func (f *File) Cache() *keycache.Cache {
 }
 
 func (f *File) Delegate(record passvault.PasswordRecord, name, password string, users, labels []string, uses int, slot, durationString string) error {
-	return f.cache.AddKeyFromRecord(record, name, password, users, labels, uses, slot, durationString)
+	return f.cache.AddKeyFromRecordGeneration(record, name, password, users, labels, uses, slot, durationString, record.RevocationGeneration)
 }
 
 func (f *File) Status() *Status {
@@ -131,6 +147,7 @@ func (f *File) Status() *Status {
 func (f *File) Purge() error {
 	f.state = Active
 	f.blob = nil
+	f.snapshotID = ""
 	if err := os.Remove(f.config.Location); err != nil {
 		return err
 	}

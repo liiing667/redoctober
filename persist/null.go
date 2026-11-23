@@ -22,6 +22,10 @@ func (n *Null) Blob() []byte {
 	return nil
 }
 
+func (n *Null) SnapshotID() string {
+	return ""
+}
+
 func (n *Null) Policy() string {
 	return n.config.Policy
 }
