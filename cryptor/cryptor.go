@@ -761,6 +761,22 @@ func (c *Cryptor) Restore(name, password string, uses int, slot, durationString 
 		return nil
 	}
 
+	// Snapshot the persisted generation once. Delegation, decryption
+	// and key-cache publication must all operate on this exact blob so
+	// a concurrent commit cannot make them observe different versions
+	// of the persisted state.
+	blob := c.persist.Blob()
+	if len(blob) == 0 {
+		// An Inactive store always carries a non-empty blob. An
+		// empty blob means there is no generation to restore (a
+		// legitimate first run), which is a no-op rather than a
+		// fake successful restore.
+		if st := c.persist.Status(); st != nil && st.State == persist.Active {
+			return nil
+		}
+		return errors.New("cryptor: persistence store has no readable delegations to restore")
+	}
+
 	record, ok := c.records.GetRecord(name)
 	if !ok {
 		return errors.New("Missing user on disk")
@@ -775,7 +791,7 @@ func (c *Cryptor) Restore(name, password string, uses int, slot, durationString 
 	// just means there aren't enough delegations yet; the
 	// sentinal value ErrRestoreDelegations is returned to
 	// indicate this. However, the error
-	cache, _, _, names, _, err := c.decrypt(c.persist.Cache(), c.persist.Blob(), name)
+	cache, _, _, names, _, err := c.decrypt(c.persist.Cache(), blob, name)
 	if err != nil {
 		if err == msp.ErrNotEnoughShares {
 			return ErrRestoreDelegations
@@ -795,6 +811,14 @@ func (c *Cryptor) Restore(name, password string, uses int, slot, durationString 
 	err = rcache.Restore()
 	if err != nil {
 		return err
+	}
+
+	// Another restore may have activated the store while this one
+	// was collecting delegations. In that case the already-active
+	// keycache is the authoritative generation; don't replace it.
+	if st := c.persist.Status(); st != nil && st.State == persist.Active {
+		c.persist.Cache().Flush()
+		return nil
 	}
 
 	c.cache = rcache
