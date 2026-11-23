@@ -245,7 +245,7 @@ func validateUser(name, password string, admin bool) error {
 	return nil
 }
 
-//Username must start with an alphanumeric character and can include "-" and "_" after the first
+// Username must start with an alphanumeric character and can include "-" and "_" after the first
 var validName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9\_\-]*$`).MatchString
 
 // validateName checks that the username and password pass a validation test.
@@ -299,6 +299,14 @@ func Init(path string, config *config.Config) error {
 
 	crypt, err = cryptor.New(&records, nil, config)
 	if err != nil {
+		return err
+	}
+
+	// Prime the key cache with the identity generations currently
+	// authoritative in the vault. Any live or persisted delegation
+	// left over from a previous process is rejected if it references
+	// a generation that has since been retired.
+	if err = crypt.SyncGenerations(); err != nil {
 		return err
 	}
 
@@ -613,6 +621,15 @@ func Password(jsonIn []byte) ([]byte, error) {
 		return jsonStatusError(err)
 	}
 
+	// A password change retires the previous identity generation:
+	// cached keys and persisted delegations created with the old
+	// password must stop decrypting immediately, including after a
+	// restart. When the password itself is unchanged this is a no-op
+	// because ChangePassword does not allocate a new generation.
+	if err = crypt.SyncGenerations(); err != nil {
+		return jsonStatusError(err)
+	}
+
 	return jsonStatusOk()
 }
 
@@ -878,9 +895,25 @@ func Modify(jsonIn []byte) ([]byte, error) {
 	switch s.Command {
 	case "delete":
 		err = records.DeleteRecord(s.ToModify)
+		if err != nil {
+			return jsonStatusError(err)
+		}
+		// The identity no longer exists: drop every live delegation
+		// and retire any persisted reference so the same username
+		// cannot resurrect the old permissions after a restart.
+		err = crypt.InvalidateUser(s.ToModify)
 	case "revoke":
 		err = records.RevokeRecord(s.ToModify)
+		if err != nil {
+			return jsonStatusError(err)
+		}
+		// Revoking admin rights retires the record's identity
+		// generation, removing all of its outstanding delegations.
+		err = crypt.SyncGenerations()
 	case "admin":
+		// Granting admin rights is an additive change and must not
+		// disturb existing delegations, so the generation is left
+		// untouched.
 		err = records.MakeAdmin(s.ToModify)
 	default:
 		err = fmt.Errorf("core: unknown command '%s' passed to modify", s.Command)

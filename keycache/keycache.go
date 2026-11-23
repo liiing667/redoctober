@@ -47,6 +47,11 @@ type ActiveUser struct {
 	Type     string
 	Key      []byte
 
+	// Generation is the identity generation of the delegator at the
+	// time the delegation was created. A cached key is only valid
+	// while its generation matches the record's current generation.
+	Generation uint64
+
 	rsaKey rsa.PrivateKey
 	eccKey *ecdsa.PrivateKey
 }
@@ -55,6 +60,13 @@ type ActiveUser struct {
 type Cache struct {
 	lock     *sync.Mutex
 	UserKeys map[DelegateIndex]ActiveUser
+
+	// generations records the current identity generation of every
+	// user the cache knows about. An entry whose Generation differs
+	// from the recorded one is stale and can never be used; an entry
+	// for a user that has vanished from the registry (a deleted
+	// identity) is stale as well.
+	generations map[string]uint64
 }
 
 // matchesLabel returns true if this usage applies the user and label
@@ -96,16 +108,118 @@ func (usage Usage) matches(user string, labels []string) bool {
 // NewCache initalizes a new cache.
 func NewCache() Cache {
 	return Cache{
-		UserKeys: make(map[DelegateIndex]ActiveUser),
-		lock:     new(sync.Mutex),
+		UserKeys:    make(map[DelegateIndex]ActiveUser),
+		generations: make(map[string]uint64),
+		lock:        new(sync.Mutex),
 	}
 }
 
+// currentGeneration reports the generation the cache currently holds
+// for a user. The boolean is false when the user is unknown to the
+// cache, which means no generation check can be applied.
+func (cache *Cache) currentGeneration(name string) (uint64, bool) {
+	gen, ok := cache.generations[name]
+	return gen, ok
+}
+
+// generationValid reports whether a delegated key carrying gen for
+// name still belongs to the user's current identity generation.
+func (cache *Cache) generationValid(name string, gen uint64) bool {
+	current, ok := cache.currentGeneration(name)
+	if !ok {
+		// No registry information: retain the legacy behaviour so
+		// that caches which have never been synchronised keep
+		// working. Production servers always synchronise the
+		// registry during initialisation.
+		return true
+	}
+	return current == gen
+}
+
+// SetGeneration records the current identity generation of a user and
+// immediately retires every cached delegation for that user which was
+// minted under an earlier generation. It returns the number of
+// delegations removed.
+func (cache *Cache) SetGeneration(name string, generation uint64) int {
+	cache.lock.Lock()
+	defer cache.lock.Unlock()
+
+	cache.generations[name] = generation
+
+	var removed int
+	for d, active := range cache.UserKeys {
+		if d.Name == name && active.Generation != generation {
+			delete(cache.UserKeys, d)
+			removed++
+		}
+	}
+	return removed
+}
+
+// SyncGenerations reconciles the cache with the identity generations
+// currently held by the vault. Delegations whose generation no longer
+// matches are pruned, and delegations belonging to users that no
+// longer exist are removed as well. It returns the number of
+// delegations removed.
+func (cache *Cache) SyncGenerations(current map[string]uint64) int {
+	cache.lock.Lock()
+	defer cache.lock.Unlock()
+
+	// Replace the registry with the vault's authoritative view.
+	cache.generations = make(map[string]uint64, len(current))
+	for name, generation := range current {
+		cache.generations[name] = generation
+	}
+
+	var removed int
+	for d, active := range cache.UserKeys {
+		generation, ok := current[d.Name]
+		if !ok || generation != active.Generation {
+			delete(cache.UserKeys, d)
+			removed++
+		}
+	}
+	return removed
+}
+
+// InvalidateUser retires every delegation currently held for name.
+// The last known generation is kept in the registry so that stale
+// entries restored later (for example from the persistence file)
+// remain rejected.
+func (cache *Cache) InvalidateUser(name string) int {
+	cache.lock.Lock()
+	defer cache.lock.Unlock()
+
+	var removed int
+	for d := range cache.UserKeys {
+		if d.Name == name {
+			delete(cache.UserKeys, d)
+			removed++
+		}
+	}
+	return removed
+}
+
 // NewFrom takes the output of GetSummary and returns a new keycache.
-func NewFrom(summary map[string]ActiveUser) *Cache {
+// The optional generations map holds the identity generations
+// currently authoritative in the vault; restored entries that
+// reference a retired generation, or a user which no longer exists,
+// are dropped instead of being resurrected. An omitted or nil
+// registry preserves the legacy behaviour.
+func NewFrom(summary map[string]ActiveUser, generationSets ...map[string]uint64) *Cache {
+	var generations map[string]uint64
+	if len(generationSets) != 0 {
+		generations = generationSets[0]
+	}
+
 	cache := &Cache{
-		UserKeys: make(map[DelegateIndex]ActiveUser),
-		lock:     new(sync.Mutex),
+		UserKeys:    make(map[DelegateIndex]ActiveUser),
+		generations: make(map[string]uint64),
+		lock:        new(sync.Mutex),
+	}
+
+	for name, generation := range generations {
+		cache.generations[name] = generation
 	}
 
 	for di, user := range summary {
@@ -116,6 +230,16 @@ func NewFrom(summary map[string]ActiveUser) *Cache {
 
 		if len(diSplit) == 2 {
 			index.Slot = diSplit[1]
+		}
+
+		// Refuse to resurrect a reference whose identity
+		// generation has been retired or whose user is gone.
+		if current, ok := cache.generations[index.Name]; ok {
+			if current != user.Generation {
+				continue
+			}
+		} else if generations != nil {
+			continue
 		}
 		cache.UserKeys[index] = user
 	}
@@ -136,6 +260,9 @@ func (cache *Cache) Valid(name, user string, labels []string) (present bool) {
 		if d.Name != name {
 			continue
 		}
+		if !cache.generationValid(d.Name, key.Generation) {
+			continue
+		}
 		if key.Usage.matches(user, labels) {
 			return true
 		}
@@ -150,6 +277,9 @@ func (cache *Cache) MatchUser(name, user string, labels []string) (ActiveUser, s
 	var key ActiveUser
 	for d, key := range cache.UserKeys {
 		if d.Name != name {
+			continue
+		}
+		if !cache.generationValid(d.Name, key.Generation) {
 			continue
 		}
 		if key.Usage.matches(user, labels) {
@@ -209,7 +339,7 @@ func (cache *Cache) Refresh() int {
 	var removed int
 
 	for d, active := range cache.UserKeys {
-		if active.Usage.Expiry.Before(time.Now()) {
+		if active.Usage.Expiry.Before(time.Now()) || !cache.generationValid(d.Name, active.Generation) {
 			log.Println("Record expired", d.Name, d.Slot, active.Usage.Users, active.Usage.Labels, active.Usage.Expiry)
 			removed++
 			delete(cache.UserKeys, d)
@@ -260,9 +390,14 @@ func (cache *Cache) AddKeyFromRecord(record passvault.PasswordRecord, name, pass
 	// set types
 	current.Type = record.Type
 	current.Admin = record.Admin
+	current.Generation = record.Generation
 
 	// add current to map (overwriting previous for this name)
 	cache.setUser(current, name, slot)
+
+	// Register the generation this delegation belongs to. Any older
+	// delegation still in the cache is now stale and is pruned.
+	cache.SetGeneration(name, record.Generation)
 
 	return
 }
@@ -370,6 +505,9 @@ func (cache *Cache) DelegateStatus(name string, labels, admins []string) (admins
 	for _, admin := range admins {
 		for di, use := range cache.UserKeys {
 			if di.Name != admin {
+				continue
+			}
+			if !cache.generationValid(di.Name, use.Generation) {
 				continue
 			}
 			nameFound := false

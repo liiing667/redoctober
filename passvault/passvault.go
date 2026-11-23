@@ -70,7 +70,14 @@ type PasswordRecord struct {
 	PasswordSalt   []byte
 	HashedPassword []byte
 	KeySalt        []byte
-	RSAKey         struct {
+	// Generation is the identity generation of this record. It is
+	// bumped every time the record's credentials or trust status
+	// change (password change, admin revocation, deletion). Every
+	// delegated key, persisted delegation and summary entry is tagged
+	// with the generation it was created under, so that references
+	// minted by an earlier generation can never be used again.
+	Generation uint64
+	RSAKey     struct {
 		RSAExp      []byte
 		RSAExpIV    []byte
 		RSAPrimeP   []byte
@@ -95,6 +102,13 @@ type Records struct {
 	VaultId   int
 	HmacKey   []byte
 	Passwords map[string]PasswordRecord
+
+	// Generation is the last identity generation allocated by the
+	// vault. Every credential or trust change allocates a fresh,
+	// strictly increasing generation, so a recreated user can never
+	// reuse a generation held by a previous identity of the same
+	// name.
+	Generation uint64
 
 	localPath string // Path of current vault
 }
@@ -365,8 +379,28 @@ func (records *Records) AddNewRecord(name, password string, admin bool, userType
 	if err != nil {
 		return pr, err
 	}
+	pr.Generation = records.allocateGeneration()
 	records.SetRecord(pr, name)
 	return pr, records.WriteRecordsToDisk()
+}
+
+// allocateGeneration returns the next identity generation for the
+// vault. Generation values are unique across the whole vault and are
+// never reused, even if a username is deleted and recreated.
+func (records *Records) allocateGeneration() uint64 {
+	records.Generation++
+	return records.Generation
+}
+
+// Generations returns a map of username to the identity generation
+// currently held by that user's record. It is consumed by the key
+// cache to validate delegated keys and prune stale references.
+func (records *Records) Generations() map[string]uint64 {
+	out := make(map[string]uint64, len(records.Passwords))
+	for name, rec := range records.Passwords {
+		out[name] = rec.Generation
+	}
+	return out
 }
 
 // ChangePassword changes the password for a given user.
@@ -386,6 +420,12 @@ func (records *Records) ChangePassword(name, password, newPassword, hipchatName 
 		records.SetRecord(pr, name)
 		return records.WriteRecordsToDisk()
 	}
+
+	// The credential is changing: invalidate every delegation, cached
+	// key and persisted reference minted under the previous identity
+	// generation. The underlying key pair is preserved, but it can no
+	// longer be reached through stale references.
+	pr.Generation = records.allocateGeneration()
 
 	var keySalt []byte
 	if keySalt, err = symcrypt.MakeRandom(16); err != nil {
@@ -445,6 +485,10 @@ func (records *Records) ChangePassword(name, password, newPassword, hipchatName 
 func (records *Records) DeleteRecord(name string) error {
 	if _, ok := records.GetRecord(name); ok {
 		delete(records.Passwords, name)
+		// Retire the generation of the deleted identity so that any
+		// in-memory or persisted delegation referencing the old
+		// record stays invalid even if the username is later reused.
+		records.allocateGeneration()
 		return records.WriteRecordsToDisk()
 	}
 	return errors.New("Record missing")
@@ -454,6 +498,9 @@ func (records *Records) DeleteRecord(name string) error {
 func (records *Records) RevokeRecord(name string) error {
 	if rec, ok := records.GetRecord(name); ok {
 		rec.Admin = false
+		// Losing admin rights is a trust change: all references the
+		// record previously delegated must be retired.
+		rec.Generation = records.allocateGeneration()
 		records.SetRecord(rec, name)
 		return records.WriteRecordsToDisk()
 	}

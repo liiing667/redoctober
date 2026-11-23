@@ -61,21 +61,21 @@ func New(records *passvault.Records, cache *keycache.Cache, config *config.Confi
 // both, then he can decrypt it alone).  If a predicate is present, it must be
 // satisfied to decrypt.
 type AccessStructure struct {
-	Minimum    int
-	Names      []string
+	Minimum int
+	Names   []string
 
 	LeftNames  []string
 	RightNames []string
 
-	Predicate  string
+	Predicate string
 }
 
 // Implements msp.UserDatabase
 type UserDatabase struct {
-	names    *[]string
+	names *[]string
 
-	records  *passvault.Records
-	cache    *keycache.Cache
+	records *passvault.Records
+	cache   *keycache.Cache
 
 	user     string
 	labels   []string
@@ -126,9 +126,9 @@ type SingleWrappedKey struct {
 // EncryptedData is the format for encrypted data containing all the
 // keys necessary to decrypt it when delegated.
 type EncryptedData struct {
-	Version   int
-	VaultId   int                         `json:",omitempty"`
-	Labels    []string                    `json:",omitempty"`
+	Version int
+	VaultId int      `json:",omitempty"`
+	Labels  []string `json:",omitempty"`
 	// Usages list the endpoints which may use this data
 	// If empty, only decryption in permitted
 	Usages    []string                    `json:",omitempty"`
@@ -149,8 +149,8 @@ type pair struct {
 type mwkSlice []MultiWrappedKey
 type swkSlice []pair
 
-func (s mwkSlice) Len() int           { return len(s) }
-func (s mwkSlice) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
+func (s mwkSlice) Len() int      { return len(s) }
+func (s mwkSlice) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
 func (s mwkSlice) Less(i, j int) bool { // Alphabetic order
 	var shorter = i
 	if len(s[i].Name) > len(s[j].Name) {
@@ -682,6 +682,30 @@ func (c *Cryptor) LiveSummary() map[string]keycache.ActiveUser {
 	return c.cache.GetSummary()
 }
 
+// SyncGenerations reconciles the active key cache with the identity
+// generations currently held by the vault. Delegations minted under a
+// retired generation, or belonging to deleted users, are pruned from
+// both the live cache and the persistence store. The updated cache is
+// written back to disk when persistence is active.
+func (c *Cryptor) SyncGenerations() error {
+	removed := c.cache.SyncGenerations(c.records.Generations())
+	if removed == 0 {
+		return nil
+	}
+	return c.store()
+}
+
+// InvalidateUser retires every live delegation held by name and
+// records the user's current generation so that stale references
+// (including ones restored from the persistence file) keep failing.
+func (c *Cryptor) InvalidateUser(name string) error {
+	c.cache.InvalidateUser(name)
+	if record, ok := c.records.GetRecord(name); ok {
+		c.cache.SetGeneration(name, record.Generation)
+	}
+	return c.store()
+}
+
 // Refresh purges all expired or fully-used delegations in the
 // crypto's key cache. It returns an error if the delegations
 // should have been stored, but couldn't be.
@@ -791,7 +815,11 @@ func (c *Cryptor) Restore(name, password string, uses int, slot, durationString 
 		return err
 	}
 
-	rcache := keycache.NewFrom(uk)
+	// Rebuild the cache from the persisted summary, but validate
+	// every entry against the vault's current identity generations:
+	// references retired while the server was down must not come
+	// back to life after a restart.
+	rcache := keycache.NewFrom(uk, c.records.Generations())
 	err = rcache.Restore()
 	if err != nil {
 		return err
