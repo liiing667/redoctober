@@ -84,7 +84,7 @@ type UserDatabase struct {
 }
 
 func (u UserDatabase) ValidUser(name string) bool {
-	_, ok := u.records.GetRecord(name)
+	_, ok := u.records.CanonicalName(name)
 	return ok
 }
 
@@ -265,7 +265,7 @@ func (encrypted *EncryptedData) unlock(key []byte) (err error) {
 // wrapKey encrypts the clear key according to an access structure.
 func (encrypted *EncryptedData) wrapKey(records *passvault.Records, clearKey []byte, access AccessStructure) (err error) {
 	generateRandomKey := func(name string) (singleWrappedKey SingleWrappedKey, err error) {
-		rec, ok := records.GetRecord(name)
+		rec, _, ok := records.GetCanonicalRecord(name)
 		if !ok {
 			err = errors.New("Missing user on disk")
 			return
@@ -761,12 +761,12 @@ func (c *Cryptor) Restore(name, password string, uses int, slot, durationString 
 		return nil
 	}
 
-	record, ok := c.records.GetRecord(name)
+	record, canonical, ok := c.records.GetCanonicalRecord(name)
 	if !ok {
 		return errors.New("Missing user on disk")
 	}
 
-	err := c.persist.Delegate(record, name, password, c.persist.Users(), persist.Labels, uses, slot, durationString)
+	err := c.persist.Delegate(record, canonical, password, c.persist.Users(), persist.Labels, uses, slot, durationString)
 	if err != nil {
 		return err
 	}
@@ -775,7 +775,7 @@ func (c *Cryptor) Restore(name, password string, uses int, slot, durationString 
 	// just means there aren't enough delegations yet; the
 	// sentinal value ErrRestoreDelegations is returned to
 	// indicate this. However, the error
-	cache, _, _, names, _, err := c.decrypt(c.persist.Cache(), c.persist.Blob(), name)
+	cache, _, _, names, _, err := c.decrypt(c.persist.Cache(), c.persist.Blob(), canonical)
 	if err != nil {
 		if err == msp.ErrNotEnoughShares {
 			return ErrRestoreDelegations

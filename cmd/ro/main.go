@@ -26,13 +26,13 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-var action, user, pswd, userEnv, pswdEnv, server, caPath, pubKeyPath string
+var action, user, pswd, newPswd, userEnv, pswdEnv, server, caPath, pubKeyPath string
 
 var owners, lefters, righters, inPath, labels, usages, outPath, outEnv string
 
 var uses, minUsers int
 
-var duration, users, userType, hcName string
+var duration, users, userType, hcName, alias string
 
 var pollInterval time.Duration
 
@@ -46,6 +46,9 @@ var roServer *client.RemoteServer
 var commandSet = map[string]command{
 	"create":          command{Run: runCreate, Desc: "create the disk vault and admin account"},
 	"create-user":     command{Run: runCreateUser, Desc: "create a user account"},
+	"add-alias":       command{Run: runAddAlias, Desc: "add an alias that resolves to the user account"},
+	"remove-alias":    command{Run: runRemoveAlias, Desc: "remove an alias from the user account"},
+	"password":        command{Run: runPassword, Desc: "change the password of the user account"},
 	"summary":         command{Run: runSummary, Desc: "list the user and delegation summary"},
 	"delegate":        command{Run: runDelegate, Desc: "do decryption delegation"},
 	"encrypt":         command{Run: runEncrypt, Desc: "encrypt a file"},
@@ -77,8 +80,10 @@ func registerFlags() {
 	flag.StringVar(&outEnv, "outenv", "", "env variable for output data")
 	flag.StringVar(&user, "user", "", "username")
 	flag.StringVar(&pswd, "password", "", "password")
+	flag.StringVar(&newPswd, "new-password", "", "new password for the password subcommand")
 	flag.StringVar(&userType, "userType", "rsa", "user key type: ecc or rsa")
 	flag.StringVar(&hcName, "hipchat-name", "", "hipchat name for user, used for notifications")
+	flag.StringVar(&alias, "alias", "", "comma separated alias names attached to a user account")
 	flag.StringVar(&userEnv, "userenv", "RO_USER", "env variable for user name")
 	flag.StringVar(&pswdEnv, "pswdenv", "RO_PASS", "env variable for user password")
 	flag.DurationVar(&pollInterval, "poll-interval", time.Second, "interval for polling an outstanding order (set 0 to disable polling)")
@@ -147,10 +152,57 @@ func runCreateUser() {
 		Password:    pswd,
 		UserType:    userType,
 		HipchatName: hcName,
+		Aliases:     processCSL(alias),
 	}
 	resp, err := roServer.CreateUser(req)
 	processError("error", err)
 	fmt.Println(resp.Status)
+}
+
+func runPassword() {
+	req := core.PasswordRequest{
+		Name:        user,
+		Password:    pswd,
+		NewPassword: newPswd,
+		HipchatName: hcName,
+	}
+	resp, err := roServer.Password(req)
+	processError("error", err)
+	fmt.Println(resp.Status)
+}
+
+func runAddAlias() {
+	aliases := processCSL(alias)
+	if len(aliases) == 0 {
+		log.Fatalln("error: at least one -alias is required")
+	}
+	for _, a := range aliases {
+		req := core.AddAliasRequest{
+			Name:     user,
+			Password: pswd,
+			Alias:    a,
+		}
+		resp, err := roServer.AddAlias(req)
+		processError("error", err)
+		fmt.Println(a, resp.Status)
+	}
+}
+
+func runRemoveAlias() {
+	aliases := processCSL(alias)
+	if len(aliases) == 0 {
+		log.Fatalln("error: at least one -alias is required")
+	}
+	for _, a := range aliases {
+		req := core.RemoveAliasRequest{
+			Name:     user,
+			Password: pswd,
+			Alias:    a,
+		}
+		resp, err := roServer.RemoveAlias(req)
+		processError("error", err)
+		fmt.Println(a, resp.Status)
+	}
 }
 
 func runDelegate() {

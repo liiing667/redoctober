@@ -34,6 +34,8 @@ var functions = map[string]func([]byte) ([]byte, error){
 	"/purge":           core.Purge,
 	"/delegate":        core.Delegate,
 	"/password":        core.Password,
+	"/add-alias":       core.AddAlias,
+	"/remove-alias":    core.RemoveAlias,
 	"/encrypt":         core.Encrypt,
 	"/re-encrypt":      core.ReEncrypt,
 	"/decrypt":         core.Decrypt,

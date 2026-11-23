@@ -288,14 +288,44 @@ func (c *RemoteServer) DecryptIntoData(req core.DecryptRequest) ([]byte, error) 
 
 }
 
-// Password issues an password request to the remote server
-func (c *RemoteServer) Password(req []byte) (*core.ResponseData, error) {
+// Password issues a password request to the remote server
+func (c *RemoteServer) Password(req core.PasswordRequest) (*core.ResponseData, error) {
 	reqBytes, err := json.Marshal(req)
 	if err != nil {
 		return nil, err
 	}
 
-	respBytes, err := c.doAction("delegate", reqBytes)
+	respBytes, err := c.doAction("password", reqBytes)
+	if err != nil {
+		return nil, err
+	}
+
+	return unmarshalResponseData(respBytes)
+}
+
+// AddAlias issues an add-alias request to the remote server
+func (c *RemoteServer) AddAlias(req core.AddAliasRequest) (*core.ResponseData, error) {
+	reqBytes, err := json.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+
+	respBytes, err := c.doAction("add-alias", reqBytes)
+	if err != nil {
+		return nil, err
+	}
+
+	return unmarshalResponseData(respBytes)
+}
+
+// RemoveAlias issues a remove-alias request to the remote server
+func (c *RemoteServer) RemoveAlias(req core.RemoveAliasRequest) (*core.ResponseData, error) {
+	reqBytes, err := json.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+
+	respBytes, err := c.doAction("remove-alias", reqBytes)
 	if err != nil {
 		return nil, err
 	}

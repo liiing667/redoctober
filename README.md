@@ -70,6 +70,8 @@ format is POSTed and JSON is returned.
 | [`/delegate`](#delegate) | Delegate a key to Red October |
 | [`/purge`](#purge) | Delete all delegated keys |
 | [`/password`](#password) | Change password for the authenticating user |
+| [`/add-alias`](#aliases) | Add an alias that resolves to the authenticating user's account |
+| [`/remove-alias`](#aliases) | Remove an alias from the authenticating user's account |
 | [`/encrypt`](#encrypt) | Encrypt provided data with specified owners and predicates |
 | [`/re-encrypt`](#re-encrypt) | Change encryption parameters of already encrypted data (delegation requirements must be met) |
 | [`/decrypt`](#decrypt) | Decrypt provided data assuming necesary delegation requirements have been met |
@@ -144,6 +146,7 @@ Create User creates a new user account.
 - `Password` must be at least one character long (required)
 - `UserType` can be `"RSA"` or `"ECC"` (optional, will default to `"RSA"`)
 - `HipchatName` specifies the HipChat username for `Order` notifications if configured (optional)
+- `Aliases` is an optional list of alternative names for the account. Every alias must be unique across the vault; the request fails before any record is created if an alias is already claimed by another user or duplicated in the request.
 
 #### Response:
 ```json
@@ -403,6 +406,57 @@ does not require the previously encrypted files to be re-encrypted.
     $ curl --cacert cert/server.crt https://localhost:8080/password \
            -d '{"Name":"Bill","Password":"Lizard", "NewPassword": "theLizard"}'
     {"Status":"ok"}
+
+### Aliases
+
+An alias is an alternative name that resolves to exactly one user
+account. The name under which the account was created is its
+*canonical* name, and authentication, password rotation, delegation
+and decryption all converge on that single canonical identity:
+authenticating with an alias never creates a second account or a
+parallel delegation.
+
+Aliases share the user-name namespace. An alias is rejected if it is
+already in use (as either a canonical name or another account's
+alias), so two accounts can never claim the same alias. Aliases found
+on an on-disk vault that conflict are resolved at load time in favour
+of the first (oldest) claim.
+
+| Requires Authentication | Requires Admin |
+| ----------------------- | -------------- |
+| Yes                     | No             |
+
+#### Add alias request:
+```json
+{
+    "Name": "Bill",
+    "Password": "Lizard",
+    "Alias": "bill-alias"
+}
+```
+
+#### Remove alias request:
+```json
+{
+    "Name": "bill-alias",
+    "Password": "Lizard",
+    "Alias": "bill-alias"
+}
+```
+- `Name` and `Password` authenticate the request; `Name` may itself be
+  an alias of the account (required)
+- `Alias` follows the same character rules as `Name` and must not be
+  claimed by another account (required)
+
+#### Example query:
+
+    $ curl --cacert cert/server.crt https://localhost:8080/add-alias \
+           -d '{"Name":"Bill","Password":"Lizard","Alias":"bill-alias"}'
+    {"Status":"ok"}
+
+After this call both `Bill` and `bill-alias` authenticate the same
+account, while `/summary`, delegations and decryption reports continue
+to identify it solely as `Bill`.
 
 ### Encrypt
 

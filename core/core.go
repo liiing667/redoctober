@@ -67,6 +67,7 @@ type CreateUserRequest struct {
 	Password    string
 	UserType    string
 	HipchatName string
+	Aliases     []string
 }
 
 type PasswordRequest struct {
@@ -75,6 +76,18 @@ type PasswordRequest struct {
 
 	NewPassword string
 	HipchatName string
+}
+
+type AddAliasRequest struct {
+	Name     string
+	Password string
+	Alias    string
+}
+
+type RemoveAliasRequest struct {
+	Name     string
+	Password string
+	Alias    string
 }
 
 type EncryptRequest struct {
@@ -229,7 +242,7 @@ func validateUser(name, password string, admin bool) error {
 		return errors.New("Vault is not created yet")
 	}
 
-	pr, ok := records.GetRecord(name)
+	pr, _, ok := records.GetCanonicalRecord(name)
 	if !ok {
 		return errors.New("User not present")
 	}
@@ -247,6 +260,44 @@ func validateUser(name, password string, admin bool) error {
 
 //Username must start with an alphanumeric character and can include "-" and "_" after the first
 var validName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9\_\-]*$`).MatchString
+
+// validAliasName checks the character set of an alias. Aliases use
+// the same namespace as user names.
+func validAliasName(alias string) bool {
+	return alias != "" && validName(alias, "x")
+}
+
+// canonicalize resolves a user supplied name (canonical name or
+// alias) to the account's canonical name. All identity-bearing state
+// (password records, delegation cache, reports) must be keyed by the
+// canonical name so that authenticating with an alias never creates a
+// parallel identity.
+func canonicalize(name string) (string, error) {
+	canonical, ok := records.CanonicalName(name)
+	if !ok {
+		return "", errors.New("User not present")
+	}
+	return canonical, nil
+}
+
+// canonicalizeUsers resolves every name in a list to its canonical
+// name, preserving order and de-duplicating the result.
+func canonicalizeUsers(names []string) ([]string, error) {
+	out := make([]string, 0, len(names))
+	seen := make(map[string]bool)
+	for _, name := range names {
+		canonical, err := canonicalize(name)
+		if err != nil {
+			return nil, err
+		}
+		if seen[canonical] {
+			continue
+		}
+		seen[canonical] = true
+		out = append(out, canonical)
+	}
+	return out, nil
+}
 
 // validateName checks that the username and password pass a validation test.
 func validateName(name, password string) error {
@@ -479,7 +530,7 @@ func Delegate(jsonIn []byte) ([]byte, error) {
 	// Make sure the user we are delegating to exists
 	var invalidUsers []string
 	for _, user := range s.Users {
-		if _, ok := records.GetRecord(user); !ok {
+		if _, ok := records.CanonicalName(user); !ok {
 			invalidUsers = append(invalidUsers, user)
 		}
 	}
@@ -492,19 +543,30 @@ func Delegate(jsonIn []byte) ([]byte, error) {
 	// Find password record for user and verify that their password
 	// matches. If not found then add a new entry for this user.
 
-	pr, found := records.GetRecord(s.Name)
+	pr, canonical, found := records.GetCanonicalRecord(s.Name)
 	if found {
 		if err = pr.ValidatePassword(s.Password); err != nil {
 			return jsonStatusError(err)
 		}
 	} else {
+		// GetCanonicalRecord already covers both canonical names and
+		// aliases, so reaching this branch means the name is genuinely
+		// unknown and the legacy auto-create behaviour applies.
 		if pr, err = records.AddNewRecord(s.Name, s.Password, false, passvault.DefaultRecordType); err != nil {
 			return jsonStatusError(err)
 		}
+		canonical = s.Name
+	}
+
+	// Delegation targets and labels are always stored against the
+	// canonical names of the accounts, never against aliases.
+	s.Users, err = canonicalizeUsers(s.Users)
+	if err != nil {
+		return jsonStatusError(err)
 	}
 
 	// add signed-in record to active set
-	if err = crypt.Delegate(pr, s.Name, s.Password, s.Users, s.Labels, s.Uses, s.Slot, s.Time); err != nil {
+	if err = crypt.Delegate(pr, canonical, s.Password, s.Users, s.Labels, s.Uses, s.Slot, s.Time); err != nil {
 		return jsonStatusError(err)
 	}
 
@@ -516,20 +578,20 @@ func Delegate(jsonIn []byte) ([]byte, error) {
 			// Don't re-add names to the list of people who have delegated. Instead
 			// just skip them but make sure we count their delegation
 			if len(order.OwnersDelegated) == 0 {
-				order.OwnersDelegated = append(order.OwnersDelegated, s.Name)
+				order.OwnersDelegated = append(order.OwnersDelegated, canonical)
 			} else {
 				for _, ownerName := range order.OwnersDelegated {
-					if ownerName == s.Name {
+					if ownerName == canonical {
 						continue
 					}
-					order.OwnersDelegated = append(order.OwnersDelegated, s.Name)
+					order.OwnersDelegated = append(order.OwnersDelegated, canonical)
 					order.Delegated++
 				}
 			}
 			orders.Orders[orderKey] = order
 
 			// Notify the hipchat room that there was a new delegator
-			orders.NotifyDelegation(s.Name, delegatedUser, orderKey, s.Time, s.Labels)
+			orders.NotifyDelegation(canonical, delegatedUser, orderKey, s.Time, s.Labels)
 
 		}
 	}
@@ -574,13 +636,50 @@ func CreateUser(jsonIn []byte) ([]byte, error) {
 		err = errors.New("User with that name already exists")
 		return jsonStatusError(err)
 	}
+	if _, claimed := records.CanonicalName(s.Name); claimed {
+		err = errors.New("User with that name already exists")
+		return jsonStatusError(err)
+	}
+
+	// Reject any alias that is already claimed by another account or
+	// duplicated in the request before the record itself is created.
+	seenAliases := make(map[string]bool)
+	for _, alias := range s.Aliases {
+		if !validAliasName(alias) {
+			err = errors.New("Alias must start with an alphanumeric character and can include \"-\" or \"_\" after the first character")
+			return jsonStatusError(err)
+		}
+		if alias == s.Name {
+			err = errors.New("Alias cannot be the same as the user name")
+			return jsonStatusError(err)
+		}
+		if seenAliases[alias] {
+			err = errors.New("Duplicate alias in request")
+			return jsonStatusError(err)
+		}
+		seenAliases[alias] = true
+		if records.aliasTaken(alias) {
+			err = errors.New("Alias already in use")
+			return jsonStatusError(err)
+		}
+	}
 
 	if _, err := records.AddNewRecord(s.Name, s.Password, false, s.UserType); err != nil {
 		return jsonStatusError(err)
 	}
 
 	if err = records.ChangePassword(s.Name, s.Password, "", s.HipchatName); err != nil {
+		_ = records.DeleteRecord(s.Name)
 		return jsonStatusError(err)
+	}
+
+	for _, alias := range s.Aliases {
+		if err = records.AddAlias(s.Name, alias); err != nil {
+			// Roll the whole creation back so a failed alias never
+			// leaves a partially configured account behind.
+			_ = records.DeleteRecord(s.Name)
+			return jsonStatusError(err)
+		}
 	}
 	return jsonStatusOk()
 }
@@ -616,6 +715,69 @@ func Password(jsonIn []byte) ([]byte, error) {
 	return jsonStatusOk()
 }
 
+// AddAlias processes a request to attach an alias to an account. The
+// request is rejected if the alias is already claimed so that every
+// name always resolves to at most one canonical identity.
+func AddAlias(jsonIn []byte) ([]byte, error) {
+	var s AddAliasRequest
+	var err error
+
+	defer func() {
+		if err != nil {
+			log.Printf("core.add-alias failed: user=%s alias=%s %v", s.Name, s.Alias, err)
+		} else {
+			log.Printf("core.add-alias success: user=%s alias=%s", s.Name, s.Alias)
+		}
+	}()
+
+	if err = json.Unmarshal(jsonIn, &s); err != nil {
+		return jsonStatusError(err)
+	}
+
+	if err = validateUser(s.Name, s.Password, false); err != nil {
+		return jsonStatusError(err)
+	}
+
+	if !validAliasName(s.Alias) {
+		err = errors.New("Alias must start with an alphanumeric character and can include \"-\" or \"_\" after the first character")
+		return jsonStatusError(err)
+	}
+
+	if err = records.AddAlias(s.Name, s.Alias); err != nil {
+		return jsonStatusError(err)
+	}
+
+	return jsonStatusOk()
+}
+
+// RemoveAlias processes a request to detach an alias from an account.
+func RemoveAlias(jsonIn []byte) ([]byte, error) {
+	var s RemoveAliasRequest
+	var err error
+
+	defer func() {
+		if err != nil {
+			log.Printf("core.remove-alias failed: user=%s alias=%s %v", s.Name, s.Alias, err)
+		} else {
+			log.Printf("core.remove-alias success: user=%s alias=%s", s.Name, s.Alias)
+		}
+	}()
+
+	if err = json.Unmarshal(jsonIn, &s); err != nil {
+		return jsonStatusError(err)
+	}
+
+	if err = validateUser(s.Name, s.Password, false); err != nil {
+		return jsonStatusError(err)
+	}
+
+	if err = records.RemoveAlias(s.Name, s.Alias); err != nil {
+		return jsonStatusError(err)
+	}
+
+	return jsonStatusOk()
+}
+
 // Encrypt processes an encrypt request.
 func Encrypt(jsonIn []byte) ([]byte, error) {
 	var s EncryptRequest
@@ -642,11 +804,26 @@ func Encrypt(jsonIn []byte) ([]byte, error) {
 		return jsonStatusError(err)
 	}
 
+	// Owner names embedded in the ciphertext must be canonical so
+	// that later delegation lookups never miss on an alias.
+	owners, err := canonicalizeUsers(s.Owners)
+	if err != nil {
+		return jsonStatusError(err)
+	}
+	leftOwners, err := canonicalizeUsers(s.LeftOwners)
+	if err != nil {
+		return jsonStatusError(err)
+	}
+	rightOwners, err := canonicalizeUsers(s.RightOwners)
+	if err != nil {
+		return jsonStatusError(err)
+	}
+
 	access := cryptor.AccessStructure{
 		Minimum:    s.Minimum,
-		Names:      s.Owners,
-		LeftNames:  s.LeftOwners,
-		RightNames: s.RightOwners,
+		Names:      owners,
+		LeftNames:  leftOwners,
+		RightNames: rightOwners,
 		Predicate:  s.Predicate,
 	}
 
@@ -679,7 +856,12 @@ func ReEncrypt(jsonIn []byte) ([]byte, error) {
 		return jsonStatusError(err)
 	}
 
-	data, _, _, usages, secure, err := crypt.Decrypt(s.Data, s.Name)
+	canonical, err := canonicalize(s.Name)
+	if err != nil {
+		return jsonStatusError(err)
+	}
+
+	data, _, _, usages, secure, err := crypt.Decrypt(s.Data, canonical)
 	if err != nil {
 		return jsonStatusError(err)
 	}
@@ -687,11 +869,24 @@ func ReEncrypt(jsonIn []byte) ([]byte, error) {
 		return jsonStatusError(errors.New("decryption's secure bit is false"))
 	}
 
+	owners, err := canonicalizeUsers(s.Owners)
+	if err != nil {
+		return jsonStatusError(err)
+	}
+	leftOwners, err := canonicalizeUsers(s.LeftOwners)
+	if err != nil {
+		return jsonStatusError(err)
+	}
+	rightOwners, err := canonicalizeUsers(s.RightOwners)
+	if err != nil {
+		return jsonStatusError(err)
+	}
+
 	access := cryptor.AccessStructure{
 		Minimum:    s.Minimum,
-		Names:      s.Owners,
-		LeftNames:  s.LeftOwners,
-		RightNames: s.RightOwners,
+		Names:      owners,
+		LeftNames:  leftOwners,
+		RightNames: rightOwners,
 		Predicate:  s.Predicate,
 	}
 
@@ -728,7 +923,14 @@ func Decrypt(jsonIn []byte) ([]byte, error) {
 		return jsonStatusError(err)
 	}
 
-	data, allLabels, names, usages, secure, err := crypt.Decrypt(s.Data, s.Name)
+	// Resolve any alias to the canonical name so the delegation cache
+	// is always queried with a single, stable identity.
+	canonical, err := canonicalize(s.Name)
+	if err != nil {
+		return jsonStatusError(err)
+	}
+
+	data, allLabels, names, usages, secure, err := crypt.Decrypt(s.Data, canonical)
 	if err != nil {
 		return jsonStatusError(err)
 	}
@@ -762,9 +964,9 @@ func Decrypt(jsonIn []byte) ([]byte, error) {
 	}
 
 	// Cleanup any orders that have been fulfilled and notify the room.
-	if orderKey, found := orders.FindOrder(s.Name, allLabels); found {
+	if orderKey, found := orders.FindOrder(canonical, allLabels); found {
 		delete(orders.Orders, orderKey)
-		orders.NotifyOrderFulfilled(s.Name, orderKey)
+		orders.NotifyOrderFulfilled(canonical, orderKey)
 	}
 	return jsonResponse(out)
 }
@@ -795,7 +997,12 @@ func SSHSignWith(jsonIn []byte) ([]byte, error) {
 		return jsonStatusError(err)
 	}
 
-	data, allLabels, names, usages, secure, err := crypt.Decrypt(s.Data, s.Name)
+	canonical, err := canonicalize(s.Name)
+	if err != nil {
+		return jsonStatusError(err)
+	}
+
+	data, allLabels, names, usages, secure, err := crypt.Decrypt(s.Data, canonical)
 	if err != nil {
 		return jsonStatusError(err)
 	}
@@ -836,9 +1043,9 @@ func SSHSignWith(jsonIn []byte) ([]byte, error) {
 	}
 
 	// Cleanup any orders that have been fulfilled and notify the room.
-	if orderKey, found := orders.FindOrder(s.Name, allLabels); found {
+	if orderKey, found := orders.FindOrder(canonical, allLabels); found {
 		delete(orders.Orders, orderKey)
-		orders.NotifyOrderFulfilled(s.Name, orderKey)
+		orders.NotifyOrderFulfilled(canonical, orderKey)
 	}
 	return jsonResponse(out)
 }
@@ -865,23 +1072,34 @@ func Modify(jsonIn []byte) ([]byte, error) {
 		return jsonStatusError(err)
 	}
 
-	if _, ok := records.GetRecord(s.ToModify); !ok {
+	toModify, err := canonicalize(s.ToModify)
+	if err != nil {
 		err = errors.New("core: record to modify missing")
 		return jsonStatusError(err)
 	}
 
-	if s.Name == s.ToModify {
+	if _, ok := records.GetRecord(toModify); !ok {
+		err = errors.New("core: record to modify missing")
+		return jsonStatusError(err)
+	}
+
+	requester, err := canonicalize(s.Name)
+	if err != nil {
+		return jsonStatusError(err)
+	}
+
+	if requester == toModify {
 		err = errors.New("core: cannot modify own record")
 		return jsonStatusError(err)
 	}
 
 	switch s.Command {
 	case "delete":
-		err = records.DeleteRecord(s.ToModify)
+		err = records.DeleteRecord(toModify)
 	case "revoke":
-		err = records.RevokeRecord(s.ToModify)
+		err = records.RevokeRecord(toModify)
 	case "admin":
-		err = records.MakeAdmin(s.ToModify)
+		err = records.MakeAdmin(toModify)
 	default:
 		err = fmt.Errorf("core: unknown command '%s' passed to modify", s.Command)
 		return jsonStatusError(err)
@@ -974,6 +1192,10 @@ func Order(jsonIn []byte) (out []byte, err error) {
 	if err := validateUser(o.Name, o.Password, false); err != nil {
 		return jsonStatusError(err)
 	}
+	o.Name, err = canonicalize(o.Name)
+	if err != nil {
+		return jsonStatusError(err)
+	}
 
 	// Get the owners of the ciphertext.
 	owners, _, _, err := crypt.GetOwners(o.EncryptedData)
@@ -998,6 +1220,10 @@ func Order(jsonIn []byte) (out []byte, err error) {
 
 	if len(o.Users) == 0 {
 		err = errors.New("Must specify at least one user per order.")
+		return jsonStatusError(err)
+	}
+	o.Users, err = canonicalizeUsers(o.Users)
+	if err != nil {
 		return jsonStatusError(err)
 	}
 	adminsDelegated, numDelegated := crypt.DelegateStatus(o.Users[0], o.Labels, owners)
@@ -1109,7 +1335,7 @@ func OrderCancel(jsonIn []byte) (out []byte, err error) {
 	}
 
 	if ord, ok := orders.Orders[o.OrderNum]; ok {
-		if o.Name == ord.Creator {
+		if requester, cerr := canonicalize(o.Name); cerr == nil && requester == ord.Creator {
 			delete(orders.Orders, o.OrderNum)
 			out = []byte("Successfully removed order")
 			return jsonResponse(out)
@@ -1172,7 +1398,12 @@ func Restore(jsonIn []byte) (out []byte, err error) {
 		return jsonStatusError(err)
 	}
 
-	err = crypt.Restore(req.Name, req.Password, 1, "", req.Time)
+	canonical, err := canonicalize(req.Name)
+	if err != nil {
+		return jsonStatusError(err)
+	}
+
+	err = crypt.Restore(canonical, req.Password, 1, "", req.Time)
 	if err != nil && err != cryptor.ErrRestoreDelegations {
 		return jsonStatusError(err)
 	}

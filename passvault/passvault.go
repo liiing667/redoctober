@@ -21,6 +21,7 @@ import (
 	"math/big"
 	mrand "math/rand"
 	"os"
+	"sort"
 
 	"github.com/cloudflare/redoctober/ecdh"
 	"github.com/cloudflare/redoctober/padding"
@@ -70,7 +71,11 @@ type PasswordRecord struct {
 	PasswordSalt   []byte
 	HashedPassword []byte
 	KeySalt        []byte
-	RSAKey         struct {
+	// Aliases holds the alternative user names that resolve to this
+	// record. The canonical name of the account is the key under which
+	// the record is stored in Records.Passwords.
+	Aliases []string
+	RSAKey  struct {
 		RSAExp      []byte
 		RSAExpIV    []byte
 		RSAPrimeP   []byte
@@ -101,8 +106,9 @@ type Records struct {
 
 // Summary is a minmial account summary.
 type Summary struct {
-	Admin bool
-	Type  string
+	Admin   bool
+	Type    string
+	Aliases []string
 }
 
 func init() {
@@ -282,12 +288,42 @@ func InitFrom(path string) (records Records, err error) {
 	}
 
 	err = errors.New("Format error")
-	for k, rec := range records.Passwords {
+	seenAliases := make(map[string]string)
+	recordNames := make([]string, 0, len(records.Passwords))
+	for name := range records.Passwords {
+		recordNames = append(recordNames, name)
+	}
+	sort.Strings(recordNames)
+	for _, k := range recordNames {
+		rec := records.Passwords[k]
 
 		if rec.AltNames == nil {
 			rec.AltNames = make(map[string]string)
-			records.Passwords[k] = rec
 		}
+		// Normalize and validate the alias set. Aliases that collide
+		// with a canonical name or another record's alias are dropped
+		// while loading so that identity resolution can never be
+		// ambiguous; the first (oldest) claim wins so legacy aliases
+		// keep resolving to their original account.
+		var validAliases []string
+		for _, alias := range rec.Aliases {
+			if alias == "" || alias == k {
+				continue
+			}
+			if _, taken := records.Passwords[alias]; taken {
+				continue
+			}
+			if owner, taken := seenAliases[alias]; taken {
+				if owner != k {
+					continue
+				}
+			} else {
+				seenAliases[alias] = k
+			}
+			validAliases = append(validAliases, alias)
+		}
+		rec.Aliases = validAliases
+		records.Passwords[k] = rec
 		if len(rec.PasswordSalt) != 16 {
 			return
 		}
@@ -371,7 +407,7 @@ func (records *Records) AddNewRecord(name, password string, admin bool, userType
 
 // ChangePassword changes the password for a given user.
 func (records *Records) ChangePassword(name, password, newPassword, hipchatName string) (err error) {
-	pr, ok := records.GetRecord(name)
+	pr, canonical, ok := records.GetCanonicalRecord(name)
 
 	if !ok {
 		err = errors.New("Record not present")
@@ -383,7 +419,7 @@ func (records *Records) ChangePassword(name, password, newPassword, hipchatName 
 	}
 
 	if len(newPassword) == 0 {
-		records.SetRecord(pr, name)
+		records.SetRecord(pr, canonical)
 		return records.WriteRecordsToDisk()
 	}
 
@@ -436,15 +472,15 @@ func (records *Records) ChangePassword(name, password, newPassword, hipchatName 
 
 	pr.KeySalt = keySalt
 
-	records.SetRecord(pr, name)
+	records.SetRecord(pr, canonical)
 
 	return records.WriteRecordsToDisk()
 }
 
 // DeleteRecord deletes a given record.
 func (records *Records) DeleteRecord(name string) error {
-	if _, ok := records.GetRecord(name); ok {
-		delete(records.Passwords, name)
+	if canonical, ok := records.CanonicalName(name); ok {
+		delete(records.Passwords, canonical)
 		return records.WriteRecordsToDisk()
 	}
 	return errors.New("Record missing")
@@ -452,9 +488,9 @@ func (records *Records) DeleteRecord(name string) error {
 
 // RevokeRecord removes admin status from a record.
 func (records *Records) RevokeRecord(name string) error {
-	if rec, ok := records.GetRecord(name); ok {
+	if rec, canonical, ok := records.GetCanonicalRecord(name); ok {
 		rec.Admin = false
-		records.SetRecord(rec, name)
+		records.SetRecord(rec, canonical)
 		return records.WriteRecordsToDisk()
 	}
 	return errors.New("Record missing")
@@ -462,9 +498,9 @@ func (records *Records) RevokeRecord(name string) error {
 
 // MakeAdmin adds admin status to a given record.
 func (records *Records) MakeAdmin(name string) error {
-	if rec, ok := records.GetRecord(name); ok {
+	if rec, canonical, ok := records.GetCanonicalRecord(name); ok {
 		rec.Admin = true
-		records.SetRecord(rec, name)
+		records.SetRecord(rec, canonical)
 		return records.WriteRecordsToDisk()
 	}
 	return errors.New("Record missing")
@@ -479,6 +515,124 @@ func (records *Records) SetRecord(pr PasswordRecord, name string) {
 func (records *Records) GetRecord(name string) (PasswordRecord, bool) {
 	dpr, found := records.Passwords[name]
 	return dpr, found
+}
+
+// CanonicalName resolves a user supplied name (either a canonical
+// account name or one of its aliases) to the canonical name under
+// which the record is stored. If the name does not identify any
+// account the returned boolean is false.
+func (records *Records) CanonicalName(name string) (canonical string, ok bool) {
+	if _, found := records.Passwords[name]; found {
+		return name, true
+	}
+
+	for canonicalName, rec := range records.Passwords {
+		for _, alias := range rec.Aliases {
+			if alias == name {
+				return canonicalName, true
+			}
+		}
+	}
+
+	return "", false
+}
+
+// GetCanonicalRecord returns the record for a name that may be an
+// alias. It always returns the canonical name alongside the record.
+func (records *Records) GetCanonicalRecord(name string) (pr PasswordRecord, canonical string, ok bool) {
+	canonical, ok = records.CanonicalName(name)
+	if !ok {
+		return pr, "", false
+	}
+	pr, ok = records.Passwords[canonical]
+	return pr, canonical, ok
+}
+
+// aliasTaken reports whether an alias is already claimed by any
+// stored record (either as a canonical name or as an alias).
+func (records *Records) aliasTaken(alias string) bool {
+	if _, found := records.Passwords[alias]; found {
+		return true
+	}
+
+	for _, rec := range records.Passwords {
+		for _, existing := range rec.Aliases {
+			if existing == alias {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+// AddAlias attaches an alias to the account identified by name (which
+// may itself be an alias). The alias is rejected before any change is
+// committed if it is already claimed by another account, if it equals
+// the canonical name, or if it is already registered on the same
+// account.
+func (records *Records) AddAlias(name, alias string) error {
+	if alias == "" {
+		return errors.New("Alias must not be empty")
+	}
+
+	canonical, ok := records.CanonicalName(name)
+	if !ok {
+		return errors.New("Record not present")
+	}
+
+	if alias == canonical {
+		return errors.New("Alias cannot be the same as the user name")
+	}
+
+	pr := records.Passwords[canonical]
+	for _, existing := range pr.Aliases {
+		if existing == alias {
+			return errors.New("Alias already exists for this user")
+		}
+	}
+
+	if records.aliasTaken(alias) {
+		return errors.New("Alias already in use by another user")
+	}
+
+	pr.Aliases = append(pr.Aliases, alias)
+	records.Passwords[canonical] = pr
+	return records.WriteRecordsToDisk()
+}
+
+// RemoveAlias detaches an alias from the account identified by name.
+// Removing an alias never removes the canonical name.
+func (records *Records) RemoveAlias(name, alias string) error {
+	canonical, ok := records.CanonicalName(name)
+	if !ok {
+		return errors.New("Record not present")
+	}
+
+	pr := records.Passwords[canonical]
+	for i, existing := range pr.Aliases {
+		if existing == alias {
+			pr.Aliases = append(pr.Aliases[:i], pr.Aliases[i+1:]...)
+			records.Passwords[canonical] = pr
+			return records.WriteRecordsToDisk()
+		}
+	}
+
+	return errors.New("Alias not present")
+}
+
+// GetAliases returns the aliases registered for the account
+// identified by name (which may itself be an alias).
+func (records *Records) GetAliases(name string) ([]string, bool) {
+	canonical, ok := records.CanonicalName(name)
+	if !ok {
+		return nil, false
+	}
+
+	pr := records.Passwords[canonical]
+	aliases := make([]string, len(pr.Aliases))
+	copy(aliases, pr.Aliases)
+	return aliases, true
 }
 
 // GetVaultID returns the id of the current vault.
@@ -500,7 +654,9 @@ func (records *Records) NumRecords() int {
 func (records *Records) GetSummary() (summary map[string]Summary) {
 	summary = make(map[string]Summary)
 	for name, pass := range records.Passwords {
-		summary[name] = Summary{pass.Admin, pass.Type}
+		aliases := make([]string, len(pass.Aliases))
+		copy(aliases, pass.Aliases)
+		summary[name] = Summary{Admin: pass.Admin, Type: pass.Type, Aliases: aliases}
 	}
 	return
 }
