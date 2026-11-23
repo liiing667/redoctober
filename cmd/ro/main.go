@@ -28,9 +28,11 @@ import (
 
 var action, user, pswd, userEnv, pswdEnv, server, caPath, pubKeyPath string
 
-var owners, lefters, righters, inPath, labels, usages, outPath, outEnv string
+var owners, lefters, righters, predicate, inPath, labels, usages, outPath, outEnv string
 
 var uses, minUsers int
+
+var minUsersSet bool
 
 var duration, users, userType, hcName string
 
@@ -70,6 +72,7 @@ func registerFlags() {
 	flag.StringVar(&duration, "time", "0h", "duration of delegated key uses")
 	flag.StringVar(&lefters, "left", "", "comma separated left owners")
 	flag.StringVar(&righters, "right", "", "comma separated right owners")
+	flag.StringVar(&predicate, "predicate", "", "predicate for decryption")
 	flag.StringVar(&labels, "labels", "", "comma separated labels")
 	flag.StringVar(&usages, "usages", "", "comma separated usages")
 	flag.StringVar(&inPath, "in", "", "input data file")
@@ -212,6 +215,7 @@ func runEncrypt() {
 		Usages:      processCSL(usages),
 		LeftOwners:  processCSL(lefters),
 		RightOwners: processCSL(righters),
+		Predicate:   predicate,
 		Labels:      processCSL(labels),
 		Data:        inBytes,
 	}
@@ -245,8 +249,15 @@ func runReEncrypt() {
 		Minimum:     minUsers,
 		LeftOwners:  processCSL(lefters),
 		RightOwners: processCSL(righters),
+		Predicate:   predicate,
 		Labels:      processCSL(labels),
+		Usages:      processCSL(usages),
 		Data:        encBytes,
+	}
+	if !minUsersSet {
+		// Let the server retain the source ciphertext's threshold unless the
+		// caller explicitly asked for a different one.
+		req.Minimum = 0
 	}
 
 	resp, err := roServer.ReEncrypt(req)
@@ -486,6 +497,11 @@ func main() {
 
 	registerFlags()
 	flag.Parse()
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "minUsers" {
+			minUsersSet = true
+		}
+	})
 
 	action := flag.Arg(0)
 

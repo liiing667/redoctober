@@ -186,6 +186,41 @@ func (cache *Cache) GetSummary() map[string]ActiveUser {
 	return summaryData
 }
 
+// Snapshot returns a copy of the current delegated key cache.  It is used by
+// operations that must roll back the delegated-key uses they consumed if a
+// later step fails.
+func (cache *Cache) Snapshot() map[DelegateIndex]ActiveUser {
+	users := make(map[DelegateIndex]ActiveUser)
+	if cache == nil {
+		return users
+	}
+	if cache.lock != nil {
+		cache.lock.Lock()
+		defer cache.lock.Unlock()
+	}
+	for index, user := range cache.UserKeys {
+		users[index] = user
+	}
+	return users
+}
+
+// Rollback replaces the delegated key cache with a snapshot previously
+// returned by Snapshot.
+func (cache *Cache) Rollback(snapshot map[DelegateIndex]ActiveUser) {
+	if cache == nil {
+		return
+	}
+	users := make(map[DelegateIndex]ActiveUser, len(snapshot))
+	for index, user := range snapshot {
+		users[index] = user
+	}
+	if cache.lock != nil {
+		cache.lock.Lock()
+		defer cache.lock.Unlock()
+	}
+	cache.UserKeys = users
+}
+
 // Flush removes all delegated keys. It returns true if the cache
 // wasn't empty (i.e. there were active users removed), and false if
 // the cache was empty.

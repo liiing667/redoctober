@@ -245,7 +245,7 @@ func validateUser(name, password string, admin bool) error {
 	return nil
 }
 
-//Username must start with an alphanumeric character and can include "-" and "_" after the first
+// Username must start with an alphanumeric character and can include "-" and "_" after the first
 var validName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9\_\-]*$`).MatchString
 
 // validateName checks that the username and password pass a validation test.
@@ -679,27 +679,58 @@ func ReEncrypt(jsonIn []byte) ([]byte, error) {
 		return jsonStatusError(err)
 	}
 
-	data, _, _, usages, secure, err := crypt.Decrypt(s.Data, s.Name)
-	if err != nil {
-		return jsonStatusError(err)
+	// Fields omitted by the caller are taken from the source ciphertext.
+	// This is essential when /re-encrypt is used to rotate the wrapping keys:
+	// the new ciphertext must not accidentally become available to a broader
+	// set of delegations just because the request did not repeat the source
+	// owners, predicate, or labels.
+	access := reEncryptAccessStructure(&s)
+	var labels []string
+	if len(s.Labels) > 0 {
+		labels = s.Labels
 	}
-	if !secure {
-		return jsonStatusError(errors.New("decryption's secure bit is false"))
+	var usages []string
+	if len(s.Usages) > 0 {
+		usages = s.Usages
 	}
 
-	access := cryptor.AccessStructure{
-		Minimum:    s.Minimum,
-		Names:      s.Owners,
-		LeftNames:  s.LeftOwners,
-		RightNames: s.RightOwners,
-		Predicate:  s.Predicate,
-	}
-
-	resp, err := crypt.Encrypt(data, s.Labels, usages, access)
+	resp, err := crypt.ReEncrypt(s.Data, s.Name, access, labels, usages)
 	if err != nil {
 		return jsonStatusError(err)
 	}
 	return jsonResponse(resp)
+}
+
+// reEncryptAccessStructure returns the destination access structure
+// explicitly requested by the caller.  A nil result means that the source
+// ciphertext's access structure should be reused.
+func reEncryptAccessStructure(s *ReEncryptRequest) *cryptor.AccessStructure {
+	if len(s.Owners) > 0 {
+		return &cryptor.AccessStructure{
+			Minimum: s.Minimum,
+			Names:   s.Owners,
+		}
+	}
+
+	if len(s.LeftOwners) > 0 && len(s.RightOwners) > 0 {
+		return &cryptor.AccessStructure{
+			LeftNames:  s.LeftOwners,
+			RightNames: s.RightOwners,
+		}
+	}
+
+	if s.Predicate != "" {
+		return &cryptor.AccessStructure{Predicate: s.Predicate}
+	}
+
+	if len(s.LeftOwners) > 0 || len(s.RightOwners) > 0 {
+		return &cryptor.AccessStructure{
+			LeftNames:  s.LeftOwners,
+			RightNames: s.RightOwners,
+		}
+	}
+
+	return nil
 }
 
 // Decrypt processes a decrypt request.

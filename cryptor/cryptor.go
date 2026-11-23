@@ -11,10 +11,12 @@ import (
 	"crypto/sha1"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/cloudflare/redoctober/config"
 	"github.com/cloudflare/redoctober/keycache"
@@ -28,6 +30,12 @@ import (
 const (
 	DEFAULT_VERSION = 1
 )
+
+// reEncryptMutex serialises re-encryption operations.  A re-encryption
+// consumes delegated key uses while it unwraps the source key; keeping that
+// work atomic also prevents two concurrent rewraps from racing on the same
+// delegated key.
+var reEncryptMutex sync.Mutex
 
 type Cryptor struct {
 	records *passvault.Records
@@ -61,21 +69,21 @@ func New(records *passvault.Records, cache *keycache.Cache, config *config.Confi
 // both, then he can decrypt it alone).  If a predicate is present, it must be
 // satisfied to decrypt.
 type AccessStructure struct {
-	Minimum    int
-	Names      []string
+	Minimum int
+	Names   []string
 
 	LeftNames  []string
 	RightNames []string
 
-	Predicate  string
+	Predicate string
 }
 
 // Implements msp.UserDatabase
 type UserDatabase struct {
-	names    *[]string
+	names *[]string
 
-	records  *passvault.Records
-	cache    *keycache.Cache
+	records *passvault.Records
+	cache   *keycache.Cache
 
 	user     string
 	labels   []string
@@ -126,19 +134,23 @@ type SingleWrappedKey struct {
 // EncryptedData is the format for encrypted data containing all the
 // keys necessary to decrypt it when delegated.
 type EncryptedData struct {
-	Version   int
-	VaultId   int                         `json:",omitempty"`
-	Labels    []string                    `json:",omitempty"`
+	Version int
+	VaultId int      `json:",omitempty"`
+	Labels  []string `json:",omitempty"`
 	// Usages list the endpoints which may use this data
 	// If empty, only decryption in permitted
-	Usages    []string                    `json:",omitempty"`
-	Predicate string                      `json:",omitempty"`
-	KeySet    []MultiWrappedKey           `json:",omitempty"`
-	KeySetRSA map[string]SingleWrappedKey `json:",omitempty"`
-	ShareSet  map[string][][]byte         `json:",omitempty"`
-	IV        []byte                      `json:",omitempty"`
-	Data      []byte
-	Signature []byte
+	Usages      []string                    `json:",omitempty"`
+	Predicate   string                      `json:",omitempty"`
+	Minimum     int                         `json:",omitempty"`
+	Owners      []string                    `json:",omitempty"`
+	LeftOwners  []string                    `json:",omitempty"`
+	RightOwners []string                    `json:",omitempty"`
+	KeySet      []MultiWrappedKey           `json:",omitempty"`
+	KeySetRSA   map[string]SingleWrappedKey `json:",omitempty"`
+	ShareSet    map[string][][]byte         `json:",omitempty"`
+	IV          []byte                      `json:",omitempty"`
+	Data        []byte
+	Signature   []byte
 }
 
 type pair struct {
@@ -149,8 +161,8 @@ type pair struct {
 type mwkSlice []MultiWrappedKey
 type swkSlice []pair
 
-func (s mwkSlice) Len() int           { return len(s) }
-func (s mwkSlice) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
+func (s mwkSlice) Len() int      { return len(s) }
+func (s mwkSlice) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
 func (s mwkSlice) Less(i, j int) bool { // Alphabetic order
 	var shorter = i
 	if len(s[i].Name) > len(s[j].Name) {
@@ -176,8 +188,10 @@ func (s swkSlice) Less(i, j int) bool { return s[i].name < s[j].name }
 func (encrypted *EncryptedData) computeHmac(key []byte) []byte {
 	mac := hmac.New(sha1.New, key)
 
-	// sort the multi-wrapped keys
-	mwks := mwkSlice(encrypted.KeySet)
+	// Sort copies of the key sets, labels, and usages.  computeHmac must not
+	// modify the EncryptedData: callers use the same parsed source snapshot
+	// for identity, access structure, and output.
+	mwks := mwkSlice(append([]MultiWrappedKey(nil), encrypted.KeySet...))
 	sort.Sort(mwks)
 
 	// sort the singly-wrapped keys
@@ -188,15 +202,17 @@ func (encrypted *EncryptedData) computeHmac(key []byte) []byte {
 	sort.Sort(&swks)
 
 	// sort the labels and usages
-	sort.Strings(encrypted.Labels)
-	sort.Strings(encrypted.Usages)
+	labels := append([]string(nil), encrypted.Labels...)
+	usages := append([]string(nil), encrypted.Usages...)
+	sort.Strings(labels)
+	sort.Strings(usages)
 
 	// start hashing
 	mac.Write([]byte(strconv.Itoa(encrypted.Version)))
 	mac.Write([]byte(strconv.Itoa(encrypted.VaultId)))
 
 	// hash the multi-wrapped keys
-	for _, mwk := range encrypted.KeySet {
+	for _, mwk := range mwks {
 		for _, name := range mwk.Name {
 			mac.Write([]byte(name))
 		}
@@ -214,13 +230,35 @@ func (encrypted *EncryptedData) computeHmac(key []byte) []byte {
 	mac.Write(encrypted.Data)
 
 	// hash the labels
-	for _, label := range encrypted.Labels {
+	for _, label := range labels {
 		mac.Write([]byte(label))
 	}
 
 	// hash the usages
-	for _, usage := range encrypted.Usages {
+	for _, usage := range usages {
 		mac.Write([]byte(usage))
+	}
+
+	// Hash the explicit access structure metadata.  These fields are absent
+	// from legacy ciphertexts, so their zero values preserve the historical
+	// signature while still binding new ciphertexts to their access policy.
+	if encrypted.Minimum != 0 {
+		mac.Write([]byte(strconv.Itoa(encrypted.Minimum)))
+	}
+	owners := append([]string(nil), encrypted.Owners...)
+	leftOwners := append([]string(nil), encrypted.LeftOwners...)
+	rightOwners := append([]string(nil), encrypted.RightOwners...)
+	sort.Strings(owners)
+	sort.Strings(leftOwners)
+	sort.Strings(rightOwners)
+	for _, name := range owners {
+		mac.Write([]byte(name))
+	}
+	for _, name := range leftOwners {
+		mac.Write([]byte(name))
+	}
+	for _, name := range rightOwners {
+		mac.Write([]byte(name))
 	}
 
 	return mac.Sum(nil)
@@ -262,60 +300,114 @@ func (encrypted *EncryptedData) unlock(key []byte) (err error) {
 	return json.Unmarshal(encrypted.Data, encrypted)
 }
 
+// rewrapGenerateRandomKey generates a fresh intermediary key for name and wraps it
+// with name's public key.
+func rewrapGenerateRandomKey(records *passvault.Records, name string) (singleWrappedKey SingleWrappedKey, err error) {
+	rec, ok := records.GetRecord(name)
+	if !ok {
+		err = errors.New("Missing user on disk")
+		return
+	}
+
+	if singleWrappedKey.aesKey, err = symcrypt.MakeRandom(16); err != nil {
+		return
+	}
+
+	if singleWrappedKey.Key, err = rec.EncryptKey(singleWrappedKey.aesKey); err != nil {
+		return
+	}
+
+	return
+}
+
+// rewrapEncryptClearKey applies the intermediary AES keys named in keyNames to the
+// clear key.  The order is the encryption order; DecryptKey applies the same
+// names in the opposite order.
+func rewrapEncryptClearKey(keySetRSA map[string]SingleWrappedKey, keyNames []string, clearKey []byte) (keyBytes []byte, err error) {
+	if len(clearKey) != 16 {
+		return nil, errors.New("Invalid key size")
+	}
+
+	keyBytes = make([]byte, len(clearKey))
+	copy(keyBytes, clearKey)
+	for _, keyName := range keyNames {
+		wrappedKey, ok := keySetRSA[keyName]
+		if !ok {
+			return nil, fmt.Errorf("Missing wrapped key for user '%s'", keyName)
+		}
+
+		var keyCrypt cipher.Block
+		keyCrypt, err = aes.NewCipher(wrappedKey.aesKey)
+		if err != nil {
+			return nil, err
+		}
+
+		keyCrypt.Encrypt(keyBytes, keyBytes)
+	}
+
+	return
+}
+
+// validateAccessStructure checks the parts of an access structure that can be
+// checked without touching the vault or key cache.  It lets re-encryption
+// reject an invalid destination before consuming delegated key uses.
+func validateAccessStructure(access AccessStructure) error {
+	if len(access.Names) > 0 && access.Minimum > 0 {
+		if access.Minimum > 2 {
+			return errors.New("Encryption to a list of owners with minimum > 2 is not implemented")
+		}
+		if access.Minimum > len(access.Names) {
+			return errors.New("Minimum exceeds the number of owners")
+		}
+		return nil
+	}
+	if len(access.LeftNames) > 0 && len(access.RightNames) > 0 {
+		return nil
+	}
+	if len(access.Predicate) > 0 {
+		_, err := msp.StringToMSP(access.Predicate)
+		return err
+	}
+	return errors.New("Invalid access structure.")
+}
+
 // wrapKey encrypts the clear key according to an access structure.
 func (encrypted *EncryptedData) wrapKey(records *passvault.Records, clearKey []byte, access AccessStructure) (err error) {
-	generateRandomKey := func(name string) (singleWrappedKey SingleWrappedKey, err error) {
-		rec, ok := records.GetRecord(name)
-		if !ok {
-			err = errors.New("Missing user on disk")
-			return
-		}
-
-		if singleWrappedKey.aesKey, err = symcrypt.MakeRandom(16); err != nil {
-			return
-		}
-
-		if singleWrappedKey.Key, err = rec.EncryptKey(singleWrappedKey.aesKey); err != nil {
-			return
-		}
-
-		return
+	if err = validateAccessStructure(access); err != nil {
+		return err
 	}
 
-	encryptKey := func(keyNames []string, clearKey []byte) (keyBytes []byte, err error) {
-		keyBytes = make([]byte, 16)
-		copy(keyBytes, clearKey)
-		for _, keyName := range keyNames {
-			var keyCrypt cipher.Block
-			keyCrypt, err = aes.NewCipher(encrypted.KeySetRSA[keyName].aesKey)
-			if err != nil {
-				return
-			}
-
-			keyCrypt.Encrypt(keyBytes, keyBytes)
-		}
-
-		return
-	}
+	// Reset all access metadata and wrapped-key material so a partially
+	// initialised output can never retain stale access information.
+	encrypted.Minimum = 0
+	encrypted.Owners = nil
+	encrypted.LeftOwners = nil
+	encrypted.RightOwners = nil
+	encrypted.Predicate = ""
+	encrypted.KeySet = nil
+	encrypted.KeySetRSA = nil
+	encrypted.ShareSet = nil
 
 	if len(access.Names) > 0 && access.Minimum > 0 {
 		// Generate a random AES key for each user and RSA/ECIES encrypt it
 		encrypted.KeySetRSA = make(map[string]SingleWrappedKey)
+		encrypted.Minimum = access.Minimum
+		encrypted.Owners = rewrapCloneStrings(access.Names)
 
 		for _, name := range access.Names {
-			encrypted.KeySetRSA[name], err = generateRandomKey(name)
+			encrypted.KeySetRSA[name], err = rewrapGenerateRandomKey(records, name)
 			if err != nil {
 				return err
 			}
 
 			if access.Minimum == 1 {
-				keyBytes, err := encryptKey([]string{access.Names[0]}, clearKey)
+				keyBytes, err := rewrapEncryptClearKey(encrypted.KeySetRSA, []string{name}, clearKey)
 				if err != nil {
 					return err
 				}
 
 				encrypted.KeySet = append(encrypted.KeySet, MultiWrappedKey{
-					Name: []string{access.Names[0]},
+					Name: []string{name},
 					Key:  keyBytes,
 				})
 			}
@@ -324,7 +416,7 @@ func (encrypted *EncryptedData) wrapKey(records *passvault.Records, clearKey []b
 		if access.Minimum == 2 {
 			for i := 0; i < len(access.Names); i++ {
 				for j := i + 1; j < len(access.Names); j++ {
-					keyBytes, err := encryptKey([]string{access.Names[j], access.Names[i]}, clearKey)
+					keyBytes, err := rewrapEncryptClearKey(encrypted.KeySetRSA, []string{access.Names[j], access.Names[i]}, clearKey)
 					if err != nil {
 						return err
 					}
@@ -337,23 +429,22 @@ func (encrypted *EncryptedData) wrapKey(records *passvault.Records, clearKey []b
 					encrypted.KeySet = append(encrypted.KeySet, out)
 				}
 			}
-		} else if access.Minimum > 2 {
-			err = errors.New("Encryption to a list of owners with minimum > 2 is not implemented")
-			return err
 		}
 	} else if len(access.LeftNames) > 0 && len(access.RightNames) > 0 {
 		// Generate a random AES key for each user and RSA/ECIES encrypt it
 		encrypted.KeySetRSA = make(map[string]SingleWrappedKey)
+		encrypted.LeftOwners = rewrapCloneStrings(access.LeftNames)
+		encrypted.RightOwners = rewrapCloneStrings(access.RightNames)
 
 		for _, name := range access.LeftNames {
-			encrypted.KeySetRSA[name], err = generateRandomKey(name)
+			encrypted.KeySetRSA[name], err = rewrapGenerateRandomKey(records, name)
 			if err != nil {
 				return err
 			}
 		}
 
 		for _, name := range access.RightNames {
-			encrypted.KeySetRSA[name], err = generateRandomKey(name)
+			encrypted.KeySetRSA[name], err = rewrapGenerateRandomKey(records, name)
 			if err != nil {
 				return err
 			}
@@ -368,7 +459,7 @@ func (encrypted *EncryptedData) wrapKey(records *passvault.Records, clearKey []b
 					continue
 				}
 
-				keyBytes, err := encryptKey([]string{rightName, leftName}, clearKey)
+				keyBytes, err := rewrapEncryptClearKey(encrypted.KeySetRSA, []string{rightName, leftName}, clearKey)
 				if err != nil {
 					return err
 				}
@@ -396,7 +487,7 @@ func (encrypted *EncryptedData) wrapKey(records *passvault.Records, clearKey []b
 		}
 
 		for name := range shareSet {
-			encrypted.KeySetRSA[name], err = generateRandomKey(name)
+			encrypted.KeySetRSA[name], err = rewrapGenerateRandomKey(records, name)
 			if err != nil {
 				return err
 			}
@@ -499,10 +590,76 @@ func (encrypted *EncryptedData) unwrapKey(cache *keycache.Cache, user string) (u
 	return
 }
 
+// rewrapCloneStrings copies a string slice while preserving the distinction
+// between a nil slice (field omitted) and an explicitly empty slice.
+func rewrapCloneStrings(in []string) []string {
+	if in == nil {
+		return nil
+	}
+	out := make([]string, len(in))
+	copy(out, in)
+	return out
+}
+
+// rewrapCloneBytes copies a byte slice.
+func rewrapCloneBytes(in []byte) []byte {
+	if in == nil {
+		return nil
+	}
+	out := make([]byte, len(in))
+	copy(out, in)
+	return out
+}
+
+// unlockAndVerify parses in, unlocks it if necessary, and verifies that it
+// belongs to the active vault and has a valid signature.  The returned
+// EncryptedData is the single source snapshot used by callers.
+func (c *Cryptor) unlockAndVerify(in []byte) (encrypted EncryptedData, secure bool, err error) {
+	if err = json.Unmarshal(in, &encrypted); err != nil {
+		return
+	}
+	if encrypted.Version != DEFAULT_VERSION && encrypted.Version != -1 {
+		err = errors.New("Unknown version")
+		return
+	}
+
+	secure = encrypted.Version == -1
+
+	hmacKey, err := c.records.GetHMACKey()
+	if err != nil {
+		return encrypted, secure, err
+	}
+
+	if err = encrypted.unlock(hmacKey); err != nil {
+		return encrypted, secure, err
+	}
+
+	// make sure file was encrypted with the active vault
+	vaultId, err := c.records.GetVaultID()
+	if err != nil {
+		return encrypted, secure, err
+	}
+	if encrypted.VaultId != vaultId {
+		return encrypted, secure, errors.New("Wrong vault")
+	}
+
+	// compute HMAC
+	expectedMAC := encrypted.computeHmac(hmacKey)
+	if !hmac.Equal(encrypted.Signature, expectedMAC) {
+		return encrypted, secure, errors.New("Signature mismatch")
+	}
+
+	return encrypted, secure, nil
+}
+
 // Encrypt encrypts data with the keys associated with names. This
 // requires a minimum of min keys to decrypt.  NOTE: as currently
 // implemented, the maximum value for min is 2.
 func (c *Cryptor) Encrypt(in []byte, labels []string, usages []string, access AccessStructure) (resp []byte, err error) {
+	if err = validateAccessStructure(access); err != nil {
+		return nil, err
+	}
+
 	var encrypted EncryptedData
 	encrypted.Version = DEFAULT_VERSION
 	if encrypted.VaultId, err = c.records.GetVaultID(); err != nil {
@@ -538,8 +695,8 @@ func (c *Cryptor) Encrypt(in []byte, labels []string, usages []string, access Ac
 	aesCBC.CryptBlocks(encryptedFile, clearFile)
 
 	encrypted.Data = encryptedFile
-	encrypted.Labels = labels
-	encrypted.Usages = usages
+	encrypted.Labels = rewrapCloneStrings(labels)
+	encrypted.Usages = rewrapCloneStrings(usages)
 
 	hmacKey, err := c.records.GetHMACKey()
 	if err != nil {
@@ -551,45 +708,262 @@ func (c *Cryptor) Encrypt(in []byte, labels []string, usages []string, access Ac
 	return json.Marshal(encrypted)
 }
 
+// ReEncrypt re-wraps an existing ciphertext under a fresh set of
+// intermediary keys.  The source data key, IV, and ciphertext are kept
+// unchanged; only the wrapping keys and, optionally, the access structure,
+// labels, and usages are replaced.
+//
+// A nil access, labels, or usages means "keep the source value".  A
+// non-nil value replaces the corresponding source value.  All work is
+// staged in local variables and the result is returned only after the whole
+// output has been wrapped, signed, and serialised.  If anything fails, the
+// delegated key usage consumed while unwrapping the source is rolled back.
+func (c *Cryptor) ReEncrypt(in []byte, user string, access *AccessStructure, labels, usages []string) (out []byte, err error) {
+	reEncryptMutex.Lock()
+	defer reEncryptMutex.Unlock()
+
+	source, secure, err := c.unlockAndVerify(in)
+	if err != nil {
+		return nil, err
+	}
+	if !secure {
+		return nil, errors.New("decryption's secure bit is false")
+	}
+
+	if labels == nil {
+		labels = rewrapCloneStrings(source.Labels)
+	}
+	if usages == nil {
+		usages = rewrapCloneStrings(source.Usages)
+	}
+
+	if access != nil {
+		destination := *access
+		if len(destination.Names) > 0 && destination.Minimum <= 0 {
+			// If the caller supplied owners but omitted the threshold,
+			// retain the threshold of the source owner structure.  If the
+			// source used a predicate, fall back to the conventional
+			// one-owner threshold for a single owner and two for a larger
+			// owner set.
+			destination.Minimum = sourceOwnerMinimum(source)
+			if destination.Minimum <= 0 {
+				if len(destination.Names) == 1 {
+					destination.Minimum = 1
+				} else {
+					destination.Minimum = 2
+				}
+			}
+		}
+		access = &destination
+	}
+
+	// Reject an invalid destination before consuming delegated key uses.
+	if access != nil {
+		if err = validateAccessStructure(*access); err != nil {
+			return nil, err
+		}
+	} else if len(source.Predicate) == 0 && len(source.KeySet) == 0 && len(source.KeySetRSA) == 0 {
+		return nil, errors.New("Invalid access structure.")
+	}
+
+	cacheSnapshot := c.cache.Snapshot()
+	rollback := func() {
+		c.cache.Rollback(cacheSnapshot)
+	}
+
+	clearKey, _, err := source.unwrapKey(c.cache, user)
+	if err != nil {
+		rollback()
+		return nil, err
+	}
+	if len(clearKey) != 16 {
+		rollback()
+		return nil, errors.New("Invalid key size")
+	}
+
+	rewrapped := EncryptedData{
+		Version: DEFAULT_VERSION,
+		VaultId: source.VaultId,
+		Labels:  rewrapCloneStrings(labels),
+		Usages:  rewrapCloneStrings(usages),
+		IV:      rewrapCloneBytes(source.IV),
+		Data:    rewrapCloneBytes(source.Data),
+	}
+
+	switch {
+	case access != nil:
+		err = rewrapped.wrapKey(c.records, clearKey, *access)
+	case len(source.Predicate) > 0:
+		err = rewrapped.wrapKey(c.records, clearKey, AccessStructure{Predicate: source.Predicate})
+		if err == nil {
+			copyAccessMetadata(&rewrapped, &source)
+		}
+	default:
+		err = rewrapOwnerKey(c.records, &rewrapped, clearKey, &source)
+	}
+	if err != nil {
+		rollback()
+		return nil, err
+	}
+
+	hmacKey, err := c.records.GetHMACKey()
+	if err != nil {
+		rollback()
+		return nil, err
+	}
+	rewrapped.Signature = rewrapped.computeHmac(hmacKey)
+	rewrapped.lock(hmacKey)
+
+	out, err = json.Marshal(rewrapped)
+	if err != nil {
+		rollback()
+		return nil, err
+	}
+	return out, nil
+}
+
+// copyAccessMetadata copies the explicit access metadata from source to dst.
+// The KeySet/ShareSet themselves are regenerated separately.
+func copyAccessMetadata(dst, source *EncryptedData) {
+	dst.Minimum = source.Minimum
+	dst.Owners = rewrapCloneStrings(source.Owners)
+	dst.LeftOwners = rewrapCloneStrings(source.LeftOwners)
+	dst.RightOwners = rewrapCloneStrings(source.RightOwners)
+}
+
+// sourceOwnerMinimum recovers the threshold used by an owner-based source
+// ciphertext.  Predicate and malformed structures return zero.
+func sourceOwnerMinimum(source EncryptedData) int {
+	if len(source.Predicate) > 0 {
+		return 0
+	}
+	if source.Minimum > 0 && len(source.Owners) > 0 {
+		return source.Minimum
+	}
+	if len(source.KeySet) == 0 {
+		if len(source.KeySetRSA) > 0 {
+			return 1
+		}
+		return 0
+	}
+
+	for _, mwk := range source.KeySet {
+		if len(mwk.Name) > 1 {
+			return 2
+		}
+	}
+	return 1
+}
+
+// Rewrap is an alias for ReEncrypt.
+func (c *Cryptor) Rewrap(in []byte, user string, access *AccessStructure, labels, usages []string) ([]byte, error) {
+	return c.ReEncrypt(in, user, access, labels, usages)
+}
+
+// ReWrap is an alias for ReEncrypt.
+func (c *Cryptor) ReWrap(in []byte, user string, access *AccessStructure, labels, usages []string) ([]byte, error) {
+	return c.ReEncrypt(in, user, access, labels, usages)
+}
+
+// rewrapOwnerKey regenerates the intermediary keys for an owner-based
+// ciphertext while preserving the exact combinatorial owner structure.  In
+// particular, this keeps legacy KeySet layouts (single owners, minimum-two
+// owner sets, and left/right owner sets) intact instead of guessing which
+// access-structure mode originally produced them.
+func rewrapOwnerKey(records *passvault.Records, encrypted *EncryptedData, clearKey []byte, source *EncryptedData) (err error) {
+	encrypted.KeySetRSA = make(map[string]SingleWrappedKey)
+	encrypted.KeySet = make([]MultiWrappedKey, 0, len(source.KeySet))
+	copyAccessMetadata(encrypted, source)
+
+	// Generate fresh intermediary keys for every name present in the source.
+	addName := func(name string) error {
+		if _, ok := encrypted.KeySetRSA[name]; ok {
+			return nil
+		}
+		wrapped, err := rewrapGenerateRandomKey(records, name)
+		if err != nil {
+			return err
+		}
+		encrypted.KeySetRSA[name] = wrapped
+		return nil
+	}
+
+	for _, mwk := range source.KeySet {
+		for _, name := range mwk.Name {
+			if err := addName(name); err != nil {
+				return err
+			}
+		}
+	}
+	for name := range source.KeySetRSA {
+		if _, ok := encrypted.KeySetRSA[name]; ok {
+			continue
+		}
+		// KeySetRSA can contain entries that are no longer referenced by
+		// KeySet.  They do not affect the owner structure, so ignore stale
+		// entries rather than failing an otherwise valid rewrap.
+		if _, ok := records.GetRecord(name); !ok {
+			continue
+		}
+		if err := addName(name); err != nil {
+			return err
+		}
+	}
+
+	if len(source.KeySet) == 0 {
+		// A KeySetRSA-only ciphertext has no combinatorial structure to
+		// preserve; treat every name as a single-owner entry.
+		names := make([]string, 0, len(encrypted.KeySetRSA))
+		for name := range encrypted.KeySetRSA {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			keyBytes, err := rewrapEncryptClearKey(encrypted.KeySetRSA, []string{name}, clearKey)
+			if err != nil {
+				return err
+			}
+			encrypted.KeySet = append(encrypted.KeySet, MultiWrappedKey{
+				Name: []string{name},
+				Key:  keyBytes,
+			})
+		}
+		return nil
+	}
+
+	for _, sourceMWK := range source.KeySet {
+		if len(sourceMWK.Name) == 0 {
+			return errors.New("Invalid owner structure")
+		}
+
+		// A MultiWrappedKey lists the users in the order used for
+		// decryption.  The wrapping was applied in the reverse order.
+		encryptNames := make([]string, len(sourceMWK.Name))
+		for i, name := range sourceMWK.Name {
+			encryptNames[len(sourceMWK.Name)-1-i] = name
+		}
+
+		keyBytes, err := rewrapEncryptClearKey(encrypted.KeySetRSA, encryptNames, clearKey)
+		if err != nil {
+			return err
+		}
+		encrypted.KeySet = append(encrypted.KeySet, MultiWrappedKey{
+			Name: rewrapCloneStrings(sourceMWK.Name),
+			Key:  keyBytes,
+		})
+	}
+
+	return nil
+}
+
 // Decrypt decrypts a file using the keys in the key cache.
 func (c *Cryptor) Decrypt(in []byte, user string) (resp []byte, labels, names []string, usages []string, secure bool, err error) {
 	return c.decrypt(c.cache, in, user)
 }
 
 func (c *Cryptor) decrypt(cache *keycache.Cache, in []byte, user string) (resp []byte, labels, names []string, usages []string, secure bool, err error) {
-	// unwrap encrypted file
-	var encrypted EncryptedData
-	if err = json.Unmarshal(in, &encrypted); err != nil {
-		return
-	}
-	if encrypted.Version != DEFAULT_VERSION && encrypted.Version != -1 {
-		return nil, nil, nil, nil, secure, errors.New("Unknown version")
-	}
-
-	secure = encrypted.Version == -1
-
-	hmacKey, err := c.records.GetHMACKey()
+	encrypted, secure, err := c.unlockAndVerify(in)
 	if err != nil {
-		return
-	}
-
-	if err = encrypted.unlock(hmacKey); err != nil {
-		return
-	}
-
-	// make sure file was encrypted with the active vault
-	vaultId, err := c.records.GetVaultID()
-	if err != nil {
-		return
-	}
-	if encrypted.VaultId != vaultId {
-		return nil, nil, nil, nil, secure, errors.New("Wrong vault")
-	}
-
-	// compute HMAC
-	expectedMAC := encrypted.computeHmac(hmacKey)
-	if !hmac.Equal(encrypted.Signature, expectedMAC) {
-		err = errors.New("Signature mismatch")
 		return
 	}
 
@@ -619,60 +993,44 @@ func (c *Cryptor) decrypt(cache *keycache.Cache, in []byte, user string) (resp [
 // GetOwners returns the list of users that can delegate their passwords
 // to decrypt the given encrypted secret.
 func (c *Cryptor) GetOwners(in []byte) (names, labels []string, predicate string, err error) {
-	// unwrap encrypted file
-	var encrypted EncryptedData
-	if err = json.Unmarshal(in, &encrypted); err != nil {
-		return
-	}
-	if encrypted.Version != DEFAULT_VERSION && encrypted.Version != -1 {
-		err = errors.New("Unknown version")
-		return
-	}
-
-	hmacKey, err := c.records.GetHMACKey()
+	encrypted, _, err := c.unlockAndVerify(in)
 	if err != nil {
-		return
-	}
-
-	if err = encrypted.unlock(hmacKey); err != nil {
-		return
-	}
-
-	// make sure file was encrypted with the active vault
-	vaultId, err := c.records.GetVaultID()
-	if err != nil {
-		return
-	}
-	if encrypted.VaultId != vaultId {
-		err = errors.New("Wrong vault")
-		return
-	}
-
-	// compute HMAC
-	expectedMAC := encrypted.computeHmac(hmacKey)
-	if !hmac.Equal(encrypted.Signature, expectedMAC) {
-		err = errors.New("Signature mismatch")
 		return
 	}
 
 	addedNames := make(map[string]bool)
-	for _, mwKey := range encrypted.KeySet { // names from the combinatorial method
-		for _, mwName := range mwKey.Name {
-			if !addedNames[mwName] {
-				names = append(names, mwName)
-				addedNames[mwName] = true
-			}
-		}
-	}
-
-	for name := range encrypted.ShareSet { // names from the secret splitting method
+	addName := func(name string) {
 		if !addedNames[name] {
 			names = append(names, name)
 			addedNames[name] = true
 		}
 	}
+
+	if len(encrypted.Predicate) == 0 {
+		// New ciphertexts carry the source access structure explicitly.
+		for _, name := range encrypted.Owners {
+			addName(name)
+		}
+		for _, name := range encrypted.LeftOwners {
+			addName(name)
+		}
+		for _, name := range encrypted.RightOwners {
+			addName(name)
+		}
+	}
+
+	for _, mwKey := range encrypted.KeySet { // names from the combinatorial method
+		for _, mwName := range mwKey.Name {
+			addName(mwName)
+		}
+	}
+
+	for name := range encrypted.ShareSet { // names from the secret splitting method
+		addName(name)
+	}
+	sort.Strings(names)
 	predicate = encrypted.Predicate
-	labels = encrypted.Labels
+	labels = rewrapCloneStrings(encrypted.Labels)
 
 	return
 }
