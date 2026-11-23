@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -60,8 +61,16 @@ type Cache struct {
 // matchesLabel returns true if this usage applies the user and label
 // an empty array of Users indicates that all users are valid
 func (usage Usage) matchesLabel(labels []string) bool {
-	// if asset has no labels always match
+	// An unrestricted delegation (no labels) can decrypt anything,
+	// including ciphertext that carries no labels.
 	if len(labels) == 0 {
+		return len(usage.Labels) == 0
+	}
+
+	// A label-restricted delegation never matches unlabelled
+	// ciphertext: the restriction has to be satisfied by an explicit
+	// label on the asset rather than treated as optional.
+	if len(usage.Labels) == 0 {
 		return true
 	}
 
@@ -144,6 +153,18 @@ func (cache *Cache) Valid(name, user string, labels []string) (present bool) {
 	return false
 }
 
+// ValidSlot returns true if the specific delegation identified by name
+// and slot is present and applicable to user and labels. It is used to
+// enforce the owner and label conditions at the moment a wrapped key is
+// admitted, before any key material is decrypted or usage consumed.
+func (cache *Cache) ValidSlot(name, user, slot string, labels []string) (present bool) {
+	key, ok := cache.UserKeys[DelegateIndex{Name: name, Slot: slot}]
+	if !ok {
+		return false
+	}
+	return key.Usage.matches(user, labels)
+}
+
 // MatchUser returns the matching active user if present
 // and a boolean to indicate its presence.
 func (cache *Cache) MatchUser(name, user string, labels []string) (ActiveUser, string, bool) {
@@ -160,16 +181,55 @@ func (cache *Cache) MatchUser(name, user string, labels []string) (ActiveUser, s
 	return key, "", false
 }
 
+// MatchUserSlot returns the active user for the exact delegation
+// identified by name and slot. Pinning the slot here guarantees that
+// every share decrypted for one wrapped key, and every retry of that
+// decryption, consumes the same key identity rather than re-rolling the
+// map and landing on a different slot.
+func (cache *Cache) MatchUserSlot(name, user, slot string, labels []string) (ActiveUser, bool) {
+	key, ok := cache.UserKeys[DelegateIndex{Name: name, Slot: slot}]
+	if !ok {
+		return ActiveUser{}, false
+	}
+	if !key.Usage.matches(user, labels) {
+		return ActiveUser{}, false
+	}
+	return key, true
+}
+
+// MatchingSlots returns the slots of every delegation for name that is
+// applicable to user and labels. Iterating this list lets a caller admit
+// a wrapped key deterministically instead of relying on the random
+// iteration order of the backing map, while still pinning the eventual
+// choice for the whole decryption.
+func (cache *Cache) MatchingSlots(name, user string, labels []string) []string {
+	var slots []string
+	for d, key := range cache.UserKeys {
+		if d.Name != name {
+			continue
+		}
+		if key.Usage.matches(user, labels) {
+			slots = append(slots, d.Slot)
+		}
+	}
+	sort.Strings(slots)
+	return slots
+}
+
 // useKey decrements the counter on an active key
 // for decryption or symmetric encryption
-func (cache *Cache) useKey(name, user, slot string, labels []string) {
-	if val, slot, present := cache.MatchUser(name, user, labels); present {
-		val.Usage.Uses--
-		if val.Usage.Uses <= 0 {
-			delete(cache.UserKeys, DelegateIndex{name, slot})
-		} else {
-			cache.setUser(val, name, slot)
-		}
+func (cache *Cache) useKey(name, slot string) {
+	index := DelegateIndex{Name: name, Slot: slot}
+	val, present := cache.UserKeys[index]
+	if !present {
+		return
+	}
+
+	val.Usage.Uses--
+	if val.Usage.Uses <= 0 {
+		delete(cache.UserKeys, index)
+	} else {
+		cache.setUser(val, name, slot)
 	}
 }
 
@@ -267,16 +327,27 @@ func (cache *Cache) AddKeyFromRecord(record passvault.PasswordRecord, name, pass
 	return
 }
 
-// DecryptKey decrypts a 16 byte key using the key corresponding to the name parameter
-// For RSA and EC keys, the cached RSA/EC key is used to decrypt
-// the pubEncryptedKey which is then used to decrypt the input
-// buffer.
+// DecryptKey decrypts a 16 byte key using a delegation matching name,
+// user and labels. It is a thin wrapper around DecryptKeySlot for
+// callers that do not need to pin a particular slot.
 func (cache *Cache) DecryptKey(in []byte, name, user string, labels []string, pubEncryptedKey []byte) (out []byte, err error) {
+	out, _, err = cache.DecryptKeySlot(in, name, user, "", labels, pubEncryptedKey)
+	return
+}
+
+// DecryptKeySlot decrypts a 16 byte key using the specific delegation
+// identified by name and slot. For RSA and EC keys, the cached RSA/EC
+// key is used to decrypt the pubEncryptedKey which is then used to
+// decrypt the input buffer. The owner and label conditions are checked
+// against this exact identity up front, and a use is only consumed once
+// the cryptographic operations have all succeeded, so a wrong label or
+// a missing label never burns a use.
+func (cache *Cache) DecryptKeySlot(in []byte, name, user, slot string, labels []string, pubEncryptedKey []byte) (out []byte, usedSlot string, err error) {
 	cache.Refresh()
 
-	decryptKey, slot, ok := cache.MatchUser(name, user, labels)
+	decryptKey, ok := cache.MatchUserSlot(name, user, slot, labels)
 	if !ok {
-		return nil, errors.New("Key not delegated")
+		return nil, "", errors.New("Key not delegated")
 	}
 
 	var aesKey []byte
@@ -287,40 +358,49 @@ func (cache *Cache) DecryptKey(in []byte, name, user string, labels []string, pu
 		// extract the aes key from the pubEncryptedKey
 		aesKey, err = rsa.DecryptOAEP(sha1.New(), rand.Reader, &decryptKey.rsaKey, pubEncryptedKey, nil)
 		if err != nil {
-			return out, err
+			return nil, slot, err
 		}
 	case passvault.ECCRecord:
 		// extract the aes key from the pubEncryptedKey
 		aesKey, err = ecdh.Decrypt(decryptKey.eccKey, pubEncryptedKey)
 
 		if err != nil {
-			return out, err
+			return nil, slot, err
 		}
 	default:
-		return nil, errors.New("unknown type")
+		return nil, slot, errors.New("unknown type")
 	}
 
 	// decrypt
 	aesSession, err := aes.NewCipher(aesKey)
 	if err != nil {
-		return out, err
+		return nil, slot, err
 	}
 	out = make([]byte, 16)
 	aesSession.Decrypt(out, in)
 
-	cache.useKey(name, user, slot, labels)
+	cache.useKey(name, slot)
 
-	return
+	return out, slot, nil
 }
 
 // DecryptShares decrypts an array of 16 byte shares using the key corresponding
 // to the name parameter.
 func (cache *Cache) DecryptShares(in [][]byte, name, user string, labels []string, pubEncryptedKey []byte) (out [][]byte, err error) {
+	out, _, err = cache.DecryptSharesSlot(in, name, user, "", labels, pubEncryptedKey)
+	return
+}
+
+// DecryptSharesSlot decrypts an array of 16 byte shares using the
+// specific delegation identified by name and slot. Every share for a
+// wrapped key is therefore unwrapped by the same key identity, and the
+// single use is only consumed after every share has been decrypted.
+func (cache *Cache) DecryptSharesSlot(in [][]byte, name, user, slot string, labels []string, pubEncryptedKey []byte) (out [][]byte, usedSlot string, err error) {
 	cache.Refresh()
 
-	decryptKey, slot, ok := cache.MatchUser(name, user, labels)
+	decryptKey, ok := cache.MatchUserSlot(name, user, slot, labels)
 	if !ok {
-		return nil, errors.New("Key not delegated")
+		return nil, "", errors.New("Key not delegated")
 	}
 
 	var aesKey []byte
@@ -331,23 +411,23 @@ func (cache *Cache) DecryptShares(in [][]byte, name, user string, labels []strin
 		// extract the aes key from the pubEncryptedKey
 		aesKey, err = rsa.DecryptOAEP(sha1.New(), rand.Reader, &decryptKey.rsaKey, pubEncryptedKey, nil)
 		if err != nil {
-			return
+			return nil, slot, err
 		}
 	case passvault.ECCRecord:
 		// extract the aes key from the pubEncryptedKey
 		aesKey, err = ecdh.Decrypt(decryptKey.eccKey, pubEncryptedKey)
 
 		if err != nil {
-			return
+			return nil, slot, err
 		}
 	default:
-		return nil, errors.New("unknown type")
+		return nil, slot, errors.New("unknown type")
 	}
 
 	// decrypt
 	aesSession, err := aes.NewCipher(aesKey)
 	if err != nil {
-		return
+		return nil, slot, err
 	}
 
 	for _, encShare := range in {
@@ -357,9 +437,9 @@ func (cache *Cache) DecryptShares(in [][]byte, name, user string, labels []strin
 		out = append(out, tmp)
 	}
 
-	cache.useKey(name, user, slot, labels)
+	cache.useKey(name, slot)
 
-	return
+	return out, slot, nil
 }
 
 // DelegateStatus will return a list of admins who have delegated to a particular user, for a particular label.

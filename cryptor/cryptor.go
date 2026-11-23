@@ -81,6 +81,7 @@ type UserDatabase struct {
 	labels   []string
 	keySet   map[string]SingleWrappedKey
 	shareSet map[string][][]byte
+	slots    map[string]string
 }
 
 func (u UserDatabase) ValidUser(name string) bool {
@@ -89,7 +90,11 @@ func (u UserDatabase) ValidUser(name string) bool {
 }
 
 func (u UserDatabase) CanGetShare(name string) bool {
-	_, _, ok1 := u.cache.MatchUser(name, u.user, u.labels)
+	slot, ok1 := u.slots[name]
+	if !ok1 {
+		return false
+	}
+	ok1 = u.cache.ValidSlot(name, u.user, slot, u.labels)
 	_, ok2 := u.shareSet[name]
 	_, ok3 := u.keySet[name]
 
@@ -99,10 +104,11 @@ func (u UserDatabase) CanGetShare(name string) bool {
 func (u UserDatabase) GetShare(name string) ([][]byte, error) {
 	*u.names = append(*u.names, name)
 
-	return u.cache.DecryptShares(
+	return u.cache.DecryptSharesSlot(
 		u.shareSet[name],
 		name,
 		u.user,
+		u.slots[name],
 		u.labels,
 		u.keySet[name].Key,
 	)
@@ -427,6 +433,11 @@ func (encrypted *EncryptedData) unwrapKey(cache *keycache.Cache, user string) (u
 		decryptErr error
 		fullMatch  bool = false
 		nameSet         = map[string]bool{}
+		// chosenSlots records, for every owner admitted to decrypt a
+		// wrapped key, the exact delegation slot that satisfied the
+		// owner and label conditions. It is the evidence of which key
+		// identity was actually consumed.
+		chosenSlots = map[string]string{}
 	)
 
 	if len(encrypted.Predicate) == 0 {
@@ -440,22 +451,41 @@ func (encrypted *EncryptedData) unwrapKey(cache *keycache.Cache, user string) (u
 				return nil, nil, err
 			}
 
-			// loop through users to see if they are all delegated
+			// Admit the wrapped key up front: every owner named on it
+			// must have at least one delegation applicable to this user
+			// and to the ciphertext's labels. This is where the owner
+			// and label conditions are enforced, before any key material
+			// is touched, so a restricted delegation can never match an
+			// unlabelled / mislabelled ciphertext and no use is burned
+			// by a rejected key. The eligible slots are enumerated and
+			// sorted, which removes the map's random iteration from the
+			// admission decision.
 			fullMatch = true
+			candidateSlots := map[string]string{}
 			for _, mwName := range mwKey.Name {
-				if valid := cache.Valid(mwName, user, encrypted.Labels); !valid {
+				slots := cache.MatchingSlots(mwName, user, encrypted.Labels)
+				if len(slots) == 0 {
 					fullMatch = false
 					break
 				}
+				// Deterministically pin the first eligible slot for this
+				// owner; the same identity is then used for every layer
+				// of this wrapped key and for any retry.
+				slot := slots[0]
+				candidateSlots[mwName] = slot
 				nameSet[mwName] = true
 			}
 
-			// if the keys are delegated, decrypt the mwKey with them
+			// Only once the whole wrapped key is admitted do we commit
+			// the selected slots and decrypt with them.
 			if fullMatch == true {
+				for mwName, slot := range candidateSlots {
+					chosenSlots[mwName] = slot
+				}
 				tmpKeyValue := mwKey.Key
 				for _, mwName := range mwKey.Name {
 					pubEncrypted := encrypted.KeySetRSA[mwName]
-					if tmpKeyValue, decryptErr = cache.DecryptKey(tmpKeyValue, mwName, user, encrypted.Labels, pubEncrypted.Key); decryptErr != nil {
+					if tmpKeyValue, _, decryptErr = cache.DecryptKeySlot(tmpKeyValue, mwName, user, chosenSlots[mwName], encrypted.Labels, pubEncrypted.Key); decryptErr != nil {
 						break
 					}
 				}
@@ -486,6 +516,19 @@ func (encrypted *EncryptedData) unwrapKey(cache *keycache.Cache, user string) (u
 		return nil, nil, err
 	}
 
+	// Resolve the slot that satisfies the owner and label conditions
+	// for every share owner once, up front. Every share decrypted by
+	// the MSP (including retries and nested predicates) then uses this
+	// same identity instead of re-rolling the cache map per call.
+	slots := map[string]string{}
+	for owner := range encrypted.ShareSet {
+		eligible := cache.MatchingSlots(owner, user, encrypted.Labels)
+		if len(eligible) == 0 {
+			continue
+		}
+		slots[owner] = eligible[0]
+	}
+
 	db := UserDatabase{
 		names:    &names,
 		cache:    cache,
@@ -493,6 +536,7 @@ func (encrypted *EncryptedData) unwrapKey(cache *keycache.Cache, user string) (u
 		labels:   encrypted.Labels,
 		keySet:   encrypted.KeySetRSA,
 		shareSet: encrypted.ShareSet,
+		slots:    slots,
 	}
 	unwrappedKey, err = sss.RecoverSecret(&db)
 

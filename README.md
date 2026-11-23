@@ -294,7 +294,9 @@ Any new delegation overrides the previous delegation.
    then they should submit different values for `Slot` during each `/delegate` request. (optional)
 - `Users` is a list of users that can use this delegation. Values must match the `Name` field used at creation of the user. (optional)
 - `Labels` are strings used to match the delegation to whether a encrypted secret can be decrypted. If labels were used in 
-  the encryption then at least one label must match in the delegation from both users. (optional)
+  the encryption then at least one label must match in the delegation from both users. A delegation that carries labels can
+  only decrypt a secret that is encrypted with at least one of those labels; it never matches a secret that has no labels.
+  A delegation without labels is unrestricted and can decrypt any secret. (optional)
 
 *See the first assumption for this API call
 
