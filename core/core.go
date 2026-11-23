@@ -28,7 +28,7 @@ import (
 var (
 	crypt   *cryptor.Cryptor
 	records passvault.Records
-	orders  order.Orderer
+	orders  *order.Orderer
 )
 
 // Each of these structures corresponds to the JSON expected on the
@@ -55,11 +55,12 @@ type DelegateRequest struct {
 	Name     string
 	Password string
 
-	Uses   int
-	Time   string
-	Slot   string
-	Users  []string
-	Labels []string
+	Uses     int
+	Time     string
+	Slot     string
+	Users    []string
+	Labels   []string
+	OrderNum string
 }
 
 type CreateUserRequest struct {
@@ -508,29 +509,20 @@ func Delegate(jsonIn []byte) ([]byte, error) {
 		return jsonStatusError(err)
 	}
 
-	// Make sure we capture the number who have already delegated.
+	// Make sure we capture the number who have already delegated. The
+	// delegation is bound to a single outstanding order by order number,
+	// delegator (owner), delegated user and label set, so overlapping
+	// orders never absorb each other's delegations.
+	orderNum := s.OrderNum
+	if orderNum == "" {
+		// The web UI carries the order number in the slot field of the
+		// delegation form.
+		orderNum = s.Slot
+	}
 	for _, delegatedUser := range s.Users {
-		if orderKey, found := orders.FindOrder(delegatedUser, s.Labels); found {
-			order := orders.Orders[orderKey]
-
-			// Don't re-add names to the list of people who have delegated. Instead
-			// just skip them but make sure we count their delegation
-			if len(order.OwnersDelegated) == 0 {
-				order.OwnersDelegated = append(order.OwnersDelegated, s.Name)
-			} else {
-				for _, ownerName := range order.OwnersDelegated {
-					if ownerName == s.Name {
-						continue
-					}
-					order.OwnersDelegated = append(order.OwnersDelegated, s.Name)
-					order.Delegated++
-				}
-			}
-			orders.Orders[orderKey] = order
-
+		if orderKey, found := orders.RecordDelegation(s.Name, delegatedUser, s.Labels, orderNum); found {
 			// Notify the hipchat room that there was a new delegator
 			orders.NotifyDelegation(s.Name, delegatedUser, orderKey, s.Time, s.Labels)
-
 		}
 	}
 
@@ -762,9 +754,8 @@ func Decrypt(jsonIn []byte) ([]byte, error) {
 	}
 
 	// Cleanup any orders that have been fulfilled and notify the room.
-	if orderKey, found := orders.FindOrder(s.Name, allLabels); found {
-		delete(orders.Orders, orderKey)
-		orders.NotifyOrderFulfilled(s.Name, orderKey)
+	if ord, found := orders.FulfillOrder(s.Name, allLabels); found {
+		orders.NotifyOrderFulfilled(s.Name, ord.Num)
 	}
 	return jsonResponse(out)
 }
@@ -836,9 +827,8 @@ func SSHSignWith(jsonIn []byte) ([]byte, error) {
 	}
 
 	// Cleanup any orders that have been fulfilled and notify the room.
-	if orderKey, found := orders.FindOrder(s.Name, allLabels); found {
-		delete(orders.Orders, orderKey)
-		orders.NotifyOrderFulfilled(s.Name, orderKey)
+	if ord, found := orders.FulfillOrder(s.Name, allLabels); found {
+		orders.NotifyOrderFulfilled(s.Name, ord.Num)
 	}
 	return jsonResponse(out)
 }
@@ -994,7 +984,11 @@ func Order(jsonIn []byte) (out []byte, err error) {
 		return jsonStatusError(err)
 	}
 
+	// Order numbers must be unique among outstanding orders.
 	orderNum := order.GenerateNum()
+	for _, taken := orders.GetOrder(orderNum); taken; _, taken = orders.GetOrder(orderNum) {
+		orderNum = order.GenerateNum()
+	}
 
 	if len(o.Users) == 0 {
 		err = errors.New("Must specify at least one user per order.")
@@ -1015,7 +1009,7 @@ func Order(jsonIn []byte) (out []byte, err error) {
 		o.Users,
 		o.Labels,
 		numDelegated)
-	orders.Orders[orderNum] = ord
+	orders.AddOrder(ord)
 	out, err = json.Marshal(ord)
 
 	// Get a map to any alternative name we want to notify
@@ -1049,7 +1043,7 @@ func OrdersOutstanding(jsonIn []byte) (out []byte, err error) {
 		return jsonStatusError(err)
 	}
 
-	out, err = json.Marshal(orders.Orders)
+	out, err = json.Marshal(orders.Snapshot())
 	if err != nil {
 		return jsonStatusError(err)
 	}
@@ -1075,7 +1069,7 @@ func OrderInfo(jsonIn []byte) (out []byte, err error) {
 		return jsonStatusError(err)
 	}
 
-	if ord, ok := orders.Orders[o.OrderNum]; ok {
+	if ord, ok := orders.GetOrder(o.OrderNum); ok {
 		if out, err = json.Marshal(ord); err != nil {
 			return jsonStatusError(err)
 		} else if len(out) == 0 {
@@ -1108,12 +1102,9 @@ func OrderCancel(jsonIn []byte) (out []byte, err error) {
 		return jsonStatusError(err)
 	}
 
-	if ord, ok := orders.Orders[o.OrderNum]; ok {
-		if o.Name == ord.Creator {
-			delete(orders.Orders, o.OrderNum)
-			out = []byte("Successfully removed order")
-			return jsonResponse(out)
-		}
+	if _, ok := orders.CancelOrder(o.OrderNum, o.Name); ok {
+		out = []byte("Successfully removed order")
+		return jsonResponse(out)
 	}
 	err = errors.New("Invalid Order Number")
 	return jsonStatusError(err)

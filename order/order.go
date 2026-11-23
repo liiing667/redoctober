@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"net/url"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/cloudflare/redoctober/hipchat"
@@ -47,10 +48,20 @@ type OrderIndex struct {
 // is useful for looking up information about individual Orders and
 // whether or not an order has been fulfilled. Orders that have been
 // fulfilled will be removed from the structure.
+//
+// All mutations and lookups of the outstanding orders go through the
+// Orderer methods below, which hold the Orderer's lock for the whole
+// find-check-update sequence. This makes every operation on an order a
+// single recoverable transaction: concurrent delegations, fulfillments
+// and cancellations of overlapping orders always observe the same
+// order bound to its order number, creator, target users, label set
+// and owners.
 type Orderer struct {
 	Orders        map[string]Order
 	Hipchat       hipchat.HipchatClient
 	AlternateName string
+
+	mu sync.Mutex
 }
 
 func CreateOrder(name, orderNum string, time time.Time, duration time.Duration, adminsDelegated, contacts, users, labels []string, numDelegated int) (ord Order) {
@@ -72,12 +83,13 @@ func GenerateNum() (num string) {
 	return hex.EncodeToString(b)
 }
 
-// NewOrder will create a new map of Orders
-func NewOrderer(hipchatClient hipchat.HipchatClient) (o Orderer) {
-	o.Orders = make(map[string]Order)
-	o.Hipchat = hipchatClient
-	o.AlternateName = "HipchatName"
-	return
+// NewOrderer will create a new map of Orders
+func NewOrderer(hipchatClient hipchat.HipchatClient) *Orderer {
+	return &Orderer{
+		Orders:        make(map[string]Order),
+		Hipchat:       hipchatClient,
+		AlternateName: "HipchatName",
+	}
 }
 
 // notify is a generic function for using a notifier, but it checks to make
@@ -139,30 +151,155 @@ func (o *Orderer) NotifyOrderFulfilled(name, orderNum string) {
 	notify(o, n, hipchat.PurpleBackground)
 }
 
-func (o *Orderer) FindOrder(user string, labels []string) (string, bool) {
-	for key, order := range o.Orders {
-		foundLabel := false
-		foundUser := false
-		for _, orderUser := range order.Users {
-			if orderUser == user {
-				foundUser = true
-			}
+// contains reports whether item is present in list.
+func contains(list []string, item string) bool {
+	for _, s := range list {
+		if s == item {
+			return true
 		}
-		if !foundUser {
-			continue
+	}
+	return false
+}
+
+// sameMembers reports whether a and b contain exactly the same
+// elements, ignoring order.
+func sameMembers(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	counts := make(map[string]int, len(a))
+	for _, s := range a {
+		counts[s]++
+	}
+	for _, s := range b {
+		counts[s]--
+		if counts[s] < 0 {
+			return false
 		}
-		for _, ol := range order.Labels {
-			foundLabel = false
-			for _, il := range labels {
-				if il == ol {
-					foundLabel = true
-				}
-			}
+	}
+	return true
+}
+
+// binds reports whether the order is bound to the given identity: the
+// target user must be one of the order's users, the given labels must
+// be exactly the order's label set, and, when owner is non-empty, the
+// owner must be one of the order's owners.
+func (ord Order) binds(user string, labels []string, owner string) bool {
+	if !contains(ord.Users, user) {
+		return false
+	}
+	if !sameMembers(ord.Labels, labels) {
+		return false
+	}
+	if owner != "" && !contains(ord.Owners, owner) {
+		return false
+	}
+	return true
+}
+
+// findOrderLocked locates the outstanding order bound to the given
+// identity. When orderNum is non-empty only the order with that exact
+// number is considered, and it is returned only if the rest of the
+// identity binds to it; a cancelled or unknown order number never
+// falls back to a looser match. The caller must hold o.mu.
+func (o *Orderer) findOrderLocked(user string, labels []string, owner, orderNum string) (string, bool) {
+	if orderNum != "" {
+		ord, ok := o.Orders[orderNum]
+		if !ok || !ord.binds(user, labels, owner) {
+			return "", false
 		}
-		if !foundLabel {
-			continue
+		return orderNum, true
+	}
+	for num, ord := range o.Orders {
+		if ord.binds(user, labels, owner) {
+			return num, true
 		}
-		return key, true
 	}
 	return "", false
+}
+
+// FindOrder returns the number of the outstanding order bound to the
+// given identity: target user, exact label set, owner (the delegator,
+// optional) and order number (optional).
+func (o *Orderer) FindOrder(user string, labels []string, owner, orderNum string) (string, bool) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.findOrderLocked(user, labels, owner, orderNum)
+}
+
+// AddOrder stores a newly created order.
+func (o *Orderer) AddOrder(ord Order) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.Orders[ord.Num] = ord
+}
+
+// GetOrder returns the outstanding order with the given order number.
+func (o *Orderer) GetOrder(orderNum string) (Order, bool) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	ord, ok := o.Orders[orderNum]
+	return ord, ok
+}
+
+// Snapshot returns a copy of the currently outstanding orders.
+func (o *Orderer) Snapshot() map[string]Order {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	out := make(map[string]Order, len(o.Orders))
+	for num, ord := range o.Orders {
+		out[num] = ord
+	}
+	return out
+}
+
+// CancelOrder atomically removes the order with the given number, but
+// only if it exists and name is the order's creator. It returns the
+// removed order.
+func (o *Orderer) CancelOrder(orderNum, name string) (Order, bool) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	ord, ok := o.Orders[orderNum]
+	if !ok || ord.Creator != name {
+		return Order{}, false
+	}
+	delete(o.Orders, orderNum)
+	return ord, true
+}
+
+// RecordDelegation atomically binds a delegation from owner to user to
+// the outstanding order identified by the given identity and records
+// the delegation against it. Owners that have already delegated are
+// not counted twice. It returns the number of the order the delegation
+// was recorded against.
+func (o *Orderer) RecordDelegation(owner, user string, labels []string, orderNum string) (string, bool) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	num, ok := o.findOrderLocked(user, labels, owner, orderNum)
+	if !ok {
+		return "", false
+	}
+	ord := o.Orders[num]
+	if !contains(ord.OwnersDelegated, owner) {
+		ord.OwnersDelegated = append(ord.OwnersDelegated, owner)
+		ord.Delegated++
+		o.Orders[num] = ord
+	}
+	return num, true
+}
+
+// FulfillOrder atomically finds the outstanding order bound to the
+// user and the exact label set, removes it and returns it. Orders that
+// have been cancelled are no longer outstanding and can therefore
+// never be fulfilled.
+func (o *Orderer) FulfillOrder(user string, labels []string) (Order, bool) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	num, ok := o.findOrderLocked(user, labels, "", "")
+	if !ok {
+		return Order{}, false
+	}
+	ord := o.Orders[num]
+	delete(o.Orders, num)
+	return ord, true
 }
